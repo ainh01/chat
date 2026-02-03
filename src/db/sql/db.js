@@ -3,7 +3,6 @@ const dotenv = require('dotenv');
 
 dotenv.config();
 
-// Parse connection string
 function parseConnectionString(connStr) {
   const parts = {};
   const pairs = connStr.split(';').filter(p => p.trim());
@@ -37,8 +36,7 @@ const config = {
   }
 };
 
-// Debug log (remove in production)
-console.log('🔍 Database Configuration:', {
+console.log('Database Configuration:', {
   server: config.server,
   database: config.database,
   user: config.user,
@@ -51,15 +49,15 @@ async function getPool() {
   if (!pool) {
     try {
       pool = await sql.connect(config);
-      console.log('✅ SQL Server connection pool established');
+      console.log('SQL Server connection pool established');
 
       pool.on('error', err => {
-        console.error('❌ SQL Pool Error:', err);
+        console.error('SQL Pool Error:', err);
         pool = null;
       });
 
     } catch (error) {
-      console.error('❌ Failed to connect to SQL Server:', error.message);
+      console.error('Failed to connect to SQL Server:', error.message);
       throw new Error(`Database connection failed: ${error.message}`);
     }
   }
@@ -79,7 +77,7 @@ async function query(queryText, params = {}) {
     return result;
 
   } catch (error) {
-    console.error('❌ SQL Query Error:', error.message);
+    console.error('SQL Query Error:', error.message);
     console.error('   Query:', queryText);
     console.error('   Params:', params);
     throw error;
@@ -105,7 +103,7 @@ async function closePool() {
   if (pool) {
     await pool.close();
     pool = null;
-    console.log('✅ SQL Server connection pool closed');
+    console.log('SQL Server connection pool closed');
   }
 }
 
