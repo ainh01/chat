@@ -3,7 +3,14 @@ const { requireAuth } = require('../../middleware/auth');
 const { findUserById } = require('../../models/UserCore');
 const Conversation = require('../../models/Conversation');
 const Message = require('../../models/Message');
-const { pubsub, MESSAGE_SENT } = require('../../pubsub/events');
+const User = require('../../models/User');
+const {
+  pubsub,
+  MESSAGE_SENT,
+  READ_STATUS_CHANGED,
+  USER_STATUS_CHANGED,
+  TYPING
+} = require('../../pubsub/events');
 const { withFilter } = require('graphql-subscriptions');
 
 const conversationResolvers = {
@@ -104,6 +111,15 @@ const conversationResolvers = {
     }
   },
 
+  User: {
+    id(parent) {
+      return parent._id || parent.id;
+    },
+    lastOnline(parent) {
+      return parent.last_online;
+    }
+  },
+
   Query: {
     async fetchMessages(_, { conversationId, cursor, limit = 20 }, context) {
       const user = requireAuth(context);
@@ -172,6 +188,73 @@ const conversationResolvers = {
           endCursor
         }
       };
+    },
+
+    async getReadStatus(_, { conversationId }, context) {
+      const user = requireAuth(context);
+
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId).select('participant_ids read_status');
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      return {
+        conversationId: conversation._id.toString(),
+        status: conversation.read_status ? Object.fromEntries(conversation.read_status) : {}
+      };
+    },
+
+    async getLastOnline(_, { userId }, context) {
+      const user = requireAuth(context);
+
+      if (!userId || typeof userId !== 'string') {
+        throw new GraphQLError('Invalid user ID', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      const sharedConversation = await Conversation.findOne({
+        participant_ids: { $all: [user.id, userId] }
+      });
+
+      if (!sharedConversation) {
+        throw new GraphQLError('Not connected to this user', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      let targetUser = await User.findById(userId);
+
+      if (!targetUser) {
+        throw new GraphQLError('User not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      const twoMinutesAgo = new Date(Date.now() - 120000);
+      const isOnline = targetUser.last_online >= twoMinutesAgo;
+
+      return {
+        userId: targetUser._id,
+        lastOnline: targetUser.last_online,
+        isOnline
+      };
     }
   },
 
@@ -213,8 +296,6 @@ const conversationResolvers = {
         });
 
         await conversation.save();
-
-      } else {
       }
 
       return conversation;
@@ -302,6 +383,134 @@ const conversationResolvers = {
       });
 
       return message;
+    },
+
+    async markAsRead(_, { conversationId }, context) {
+      const user = requireAuth(context);
+
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId);
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      const timestamp = new Date();
+
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        {
+          $set: {
+            [`read_status.${user.id}`]: timestamp
+          }
+        }
+      );
+
+      const receipt = {
+        conversationId: conversation._id.toString(),
+        userId: user.id,
+        timestamp
+      };
+
+      pubsub.publish(READ_STATUS_CHANGED, {
+        readStatusChanged: receipt,
+        conversationId: conversation._id.toString()
+      });
+
+      return receipt;
+    },
+
+    async updateLastOnline(_, __, context) {
+      const user = requireAuth(context);
+
+      const { redisClient } = context;
+
+      if (!redisClient) {
+        throw new GraphQLError('Redis client not available', {
+          extensions: { code: 'INTERNAL_SERVER_ERROR' }
+        });
+      }
+
+      const redisKey = `last_online:${user.id}`;
+
+      try {
+        const lastUpdate = await redisClient.get(redisKey);
+        const now = Date.now();
+
+        if (!lastUpdate || (now - parseInt(lastUpdate)) > 60000) {
+          const timestamp = await User.updateLastOnline(user.id);
+
+          await redisClient.set(redisKey, now.toString(), { EX: 300 });
+
+          pubsub.publish(USER_STATUS_CHANGED, {
+            userId: user.id,
+            lastOnline: timestamp
+          });
+
+          return {
+            _id: user.id,
+            last_online: timestamp
+          };
+        }
+
+        const cachedUser = await User.findById(user.id);
+        return cachedUser || { _id: user.id, last_online: new Date() };
+
+      } catch (error) {
+        throw new GraphQLError('Failed to update last online status', {
+          extensions: { code: 'INTERNAL_SERVER_ERROR' }
+        });
+      }
+    },
+
+    async setTyping(_, { conversationId, isTyping }, context) {
+      const user = requireAuth(context);
+
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId).select('participant_ids');
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      pubsub.publish(TYPING, {
+        typingIndicator: {
+          conversationId: conversation._id.toString(),
+          userId: user.id,
+          isTyping
+        },
+        conversationId: conversation._id.toString()
+      });
+
+      return true;
     }
   },
 
@@ -335,6 +544,92 @@ const conversationResolvers = {
 
       resolve(payload) {
         return payload.messageReceived;
+      }
+    },
+
+    readStatusChanged: {
+      subscribe: withFilter(
+        () => pubsub.asyncIterator([READ_STATUS_CHANGED]),
+
+        async (payload, variables, context) => {
+          try {
+            if (!context.user) {
+              return false;
+            }
+
+            const payloadConvId = payload.conversationId.toString();
+            const variableConvId = variables.conversationId.toString();
+
+            if (payloadConvId !== variableConvId) {
+              return false;
+            }
+
+            if (payload.readStatusChanged.userId === context.user.id) {
+              return false;
+            }
+
+            const conversation = await Conversation.findById(variables.conversationId);
+
+            if (!conversation) {
+              return false;
+            }
+
+            if (!conversation.participant_ids.includes(context.user.id)) {
+              return false;
+            }
+
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+      ),
+
+      resolve(payload) {
+        return payload.readStatusChanged;
+      }
+    },
+
+    typingIndicator: {
+      subscribe: withFilter(
+        () => pubsub.asyncIterator([TYPING]),
+
+        async (payload, variables, context) => {
+          try {
+            if (!context.user) {
+              return false;
+            }
+
+            const payloadConvId = payload.conversationId.toString();
+            const variableConvId = variables.conversationId.toString();
+
+            if (payloadConvId !== variableConvId) {
+              return false;
+            }
+
+            if (payload.typingIndicator.userId === context.user.id) {
+              return false;
+            }
+
+            const conversation = await Conversation.findById(variables.conversationId);
+
+            if (!conversation) {
+              return false;
+            }
+
+            if (!conversation.participant_ids.includes(context.user.id)) {
+              return false;
+            }
+
+            return true;
+          } catch (error) {
+            return false;
+          }
+        }
+      ),
+
+      resolve(payload) {
+        return payload.typingIndicator;
       }
     }
   }

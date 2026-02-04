@@ -195,6 +195,7 @@ const serverCleanup = useServer({
     return {
       user,
       pubsub,
+      redisClient
     };
   },
 
@@ -291,7 +292,8 @@ async function startServer() {
           const context = await buildContext({ req, res });
           return {
             ...context,
-            pubsub
+            pubsub,
+            redisClient
           };
         }
       })
@@ -397,4 +399,4 @@ process.on('unhandledRejection', (reason, promise) => {
   shutdown('unhandledRejection');
 });
 
-startServer();  
+startServer();

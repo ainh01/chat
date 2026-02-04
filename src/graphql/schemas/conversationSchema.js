@@ -56,6 +56,29 @@ type PageInfo {
   endCursor: String
 }
 
+type ReadReceipt {
+  conversationId: ID!
+  userId: String!
+  timestamp: DateTime!
+}
+
+type ReadStatusMap {
+  conversationId: ID!
+  status: JSON!
+}
+
+type LastOnlineStatus {
+  userId: String!
+  lastOnline: DateTime!
+  isOnline: Boolean!
+}
+
+type TypingStatus {
+  conversationId: ID!
+  userId: String!
+  isTyping: Boolean!
+}
+
 type Query {
   _empty: String
 }
@@ -68,29 +91,44 @@ type Subscription {
   _empty: String
 }  
 
-  extend type Query {
+extend type Query {
   fetchMessages(
     conversationId: ID!  
-      cursor: String  
-      limit: Int = 20
+    cursor: String  
+    limit: Int = 20
   ): MessageConnection!
+
+  getReadStatus(conversationId: ID!): ReadStatusMap!
+  getLastOnline(userId: String!): LastOnlineStatus!
 }  
 
-  extend type Mutation {
+extend type Mutation {
   createConversation(
     participantId: String!
   ): Conversation!
 
   sendMessage(
     conversationId: ID!  
-      content: String!
+    content: String!
   ): Message!
+
+  markAsRead(conversationId: ID!): ReadReceipt!
+  updateLastOnline: User!
+  setTyping(conversationId: ID!, isTyping: Boolean!): Boolean!
 }  
 
-  extend type Subscription {
+extend type Subscription {
   messageReceived(
     conversationId: ID!
   ): Message!
+
+  readStatusChanged(conversationId: ID!): ReadReceipt!
+  typingIndicator(conversationId: ID!): TypingStatus!
+}
+
+type User {
+  id: ID!
+  lastOnline: DateTime!
 }`;
 
-module.exports = { conversationTypeDefs };  
+module.exports = { conversationTypeDefs };
