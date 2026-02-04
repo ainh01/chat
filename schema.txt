@@ -1,0 +1,74 @@
+users collection:
+
+{
+  "_id": "String/ObjectId", // The UID from SQL database
+  "last_online": {
+    "type": "Date",
+    "description": "Updated via heartbeat. Used for 'Active Now' status."
+  }
+}
+
+conversations collection:
+
+{
+  "_id": "ObjectId", 
+  "participant_ids": {
+    "type": "Array",
+    "items": { "type": "String" },
+    "description": "Exactly two UIDs for 1-1 chat. e.g., ['userA', 'userB']"
+  },
+  "last_message": {
+    "type": "Object",
+    "description": "Cache of the latest message for the inbox preview",
+    "properties": {
+      "sender_id": "String",
+      "text": "String",
+      "time_sent": "Date"
+    }
+  },
+  "read_status": {
+    "type": "Map",
+    "description": "Keyed by UID. Stores when each user last viewed this chat.",
+    "of": { "type": "Date" }
+  },
+  "created_at": { "type": "Date", "default": "Date.now" },
+  "is_blocked": { "type": "Boolean", "default": false }
+}
+
+messages collection:
+
+{
+  "_id": "ObjectId",
+  "conversation_id": {
+    "type": "ObjectId",
+    "required": true,
+    "index": true
+  },
+  "sender_id": { "type": "String", "required": true },
+  "recipient_id": { "type": "String", "required": true },
+  "content": {
+    "type": "String",
+    "required": true,
+    "description": "The actual text or media reference"
+  },
+  "time_sent": { "type": "Date", "required": true },
+  
+  "meta": {
+    "is_unsent": { "type": "Boolean", "default": false },
+    "is_forwarded": { "type": "Boolean", "default": false },
+    "reply_to": { 
+        "type": "ObjectId", 
+        "description": "Points to _id of another message",
+        "default": null 
+    },
+    "last_edit_at": { "type": "Date", "default": null }
+  },
+
+  "reactions": [
+    {
+      "user_id": "String",
+      "type": { "type": "Number", "min": 1, "max": 6 }
+    }
+  ]
+}
+

@@ -1,0 +1,1227 @@
+════════════════════════════════════════════════════════════════════════
+CHAT FEATURE BACKLOG - GraphQL + MongoDB + WebSocket Implementation
+════════════════════════════════════════════════════════════════════════
+
+PREREQUISITES:
+- User authentication via cookie/Redis (userId available in context)
+- MongoDB connection configured
+- Apollo Server with PubSub for WebSocket subscriptions
+- Middleware: auth.js extracts userId from session
+
+════════════════════════════════════════════════════════════════════════
+PHASE 1: CORE MESSAGING INFRASTRUCTURE (P0)
+════════════════════════════════════════════════════════════════════════
+
+[CHAT-001] Create Conversation
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    createConversation(participantId: String!): Conversation!
+  }
+  
+  type Conversation {
+    id: ID!
+    participantIds: [String!]!
+    lastMessage: LastMessagePreview
+    readStatus: JSON
+    createdAt: DateTime!
+  }
+
+Authentication:
+  - Required: userId from context (cookie session)
+  - Validates: userId exists in SQL users table
+
+MongoDB Operations:
+  1. Check if conversation already exists:
+     db.conversations.findOne({ 
+       participant_ids: { $all: [userId, participantId] } 
+     })
+     
+  2. If not exists, create:
+     db.conversations.insertOne({
+       participant_ids: [userId, participantId].sort(),
+       last_message: null,
+       read_status: {},
+       created_at: new Date(),
+       is_blocked: false
+     })
+
+Business Logic:
+  - participantId ≠ userId (can't chat with self)
+  - participantId must exist in SQL users table
+  - participant_ids stored alphabetically sorted for consistent lookups
+  - Return existing conversation if already created (idempotent)
+
+Error Handling:
+  - 401: User not authenticated
+  - 400: Invalid participantId (not found in SQL)
+  - 400: participantId === userId
+
+Acceptance Criteria:
+  ✓ Creates new conversation between two users
+  ✓ Returns existing conversation if already exists
+  ✓ Rejects invalid participant IDs
+  ✓ Stores participant_ids in sorted order
+
+Index Required:
+  db.conversations.createIndex({ participant_ids: 1 })
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-002] Send Message
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    sendMessage(
+      conversationId: ID!
+      content: String!
+    ): Message!
+  }
+  
+  type Message {
+    id: ID!
+    conversationId: ID!
+    senderId: String!
+    recipientId: String!
+    content: String!
+    timeSent: DateTime!
+    meta: MessageMeta!
+    reactions: [Reaction!]!
+  }
+  
+  type MessageMeta {
+    isUnsent: Boolean!
+    isForwarded: Boolean!
+    replyTo: ID
+    lastEditAt: DateTime
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+MongoDB Operations:
+  1. Verify conversation exists and user is participant:
+     const conv = await db.conversations.findOne({
+       _id: ObjectId(conversationId),
+       participant_ids: userId
+     })
+     if (!conv) throw new Error("Unauthorized or conversation not found")
+     
+  2. Determine recipientId:
+     const recipientId = conv.participant_ids.find(id => id !== userId)
+     
+  3. Insert message:
+     const msg = await db.messages.insertOne({
+       conversation_id: ObjectId(conversationId),
+       sender_id: userId,
+       recipient_id: recipientId,
+       content: content.trim(),
+       time_sent: new Date(),
+       meta: {
+         is_unsent: false,
+         is_forwarded: false,
+         reply_to: null,
+         last_edit_at: null
+       },
+       reactions: []
+     })
+     
+  4. Update conversation's last_message (denormalization):
+     await db.conversations.updateOne(
+       { _id: ObjectId(conversationId) },
+       { $set: {
+         last_message: {
+           sender_id: userId,
+           text: content.substring(0, 100), // Preview only
+           time_sent: new Date()
+         }
+       }}
+     )
+
+WebSocket Event:
+  - Publish to: `MESSAGE_SENT:${conversationId}`
+  - Payload: Complete Message object
+  - Subscribers: Both participants (see CHAT-004)
+
+Business Logic:
+  - content must be non-empty after trim
+  - Max length: 5000 characters
+  - recipientId auto-determined from conversation participants
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant in conversation
+  - 400: Empty content or exceeds max length
+  - 404: Conversation not found
+
+Acceptance Criteria:
+  ✓ Saves message to messages collection
+  ✓ Updates conversations.last_message cache
+  ✓ Broadcasts message via WebSocket to both participants
+  ✓ Rejects non-participants
+  ✓ Trims whitespace and validates length
+
+Index Required:
+  db.messages.createIndex({ conversation_id: 1, time_sent: -1 })
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-003] Fetch Messages (with Lazy Loading)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Query {
+    fetchMessages(
+      conversationId: ID!
+      cursor: String
+      limit: Int = 20
+    ): MessageConnection!
+  }
+  
+  type MessageConnection {
+    edges: [MessageEdge!]!
+    pageInfo: PageInfo!
+  }
+  
+  type MessageEdge {
+    cursor: String!
+    node: Message!
+  }
+  
+  type PageInfo {
+    hasNextPage: Boolean!
+    endCursor: String
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+MongoDB Operations:
+  1. Verify user is participant:
+     const conv = await db.conversations.findOne({
+       _id: ObjectId(conversationId),
+       participant_ids: userId
+     })
+     
+  2. Decode cursor (if provided):
+     const cursorDate = cursor ? new Date(Buffer.from(cursor, 'base64').toString()) : new Date()
+     
+  3. Fetch messages (cursor-based pagination):
+     const messages = await db.messages.find({
+       conversation_id: ObjectId(conversationId),
+       time_sent: { $lt: cursorDate }
+     })
+     .sort({ time_sent: -1 })
+     .limit(limit + 1) // Fetch one extra to check hasNextPage
+     .toArray()
+     
+  4. Build response:
+     const hasNextPage = messages.length > limit
+     const edges = messages.slice(0, limit).map(msg => ({
+       cursor: Buffer.from(msg.time_sent.toISOString()).toString('base64'),
+       node: msg
+     }))
+
+Business Logic:
+  - Returns newest messages first (DESC order)
+  - Cursor encodes time_sent as base64 timestamp
+  - limit capped at max 100
+  - Fetch all messages including unsent. In resolver, if `meta.is_unsent`, set content = `null` (frontend displays placeholder).
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant in conversation
+  - 400: Invalid cursor format
+  - 400: limit out of range (1-100)
+
+Acceptance Criteria:
+  ✓ Returns paginated messages sorted newest first
+  ✓ Cursor-based pagination works correctly
+  ✓ hasNextPage accurately indicates more messages
+  ✓ Respects meta.is_unsent (content hidden in resolver)
+  ✓ Rejects non-participants
+
+Performance:
+  - Index on (conversation_id, time_sent) prevents full scan
+  - Estimated query time: <50ms for 10k messages
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-004] Subscribe to New Messages (WebSocket)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Subscription {
+    messageReceived(conversationId: ID!): Message!
+  }
+
+Authentication:
+  - Required: userId from WebSocket connection context
+  - Validates: userId is participant in conversationId
+
+WebSocket Implementation:
+  1. On subscribe:
+     - Verify user is participant (same check as CHAT-003)
+     - Subscribe to PubSub topic: `MESSAGE_SENT:${conversationId}`
+     
+  2. On message published (from CHAT-002):
+     - PubSub emits to all subscribers of topic
+     - Apollo sends Message object to connected clients
+     
+  3. On unsubscribe:
+     - Clean up PubSub subscription
+
+Code Example (resolver):
+  messageReceived: {
+    subscribe: withFilter(
+      (_, __, { pubsub }) => pubsub.asyncIterator(['MESSAGE_SENT']),
+      async (payload, variables, context) => {
+        // Verify user is participant
+        const conv = await db.conversations.findOne({
+          _id: ObjectId(variables.conversationId),
+          participant_ids: context.userId
+        })
+        return conv && payload.conversationId === variables.conversationId
+      }
+    )
+  }
+
+Business Logic:
+  - Only participants receive messages
+  - Subscription established before message sent (no race condition)
+  - Client receives own sent messages (for multi-device sync)
+
+Error Handling:
+  - 401: WebSocket connection not authenticated
+  - 403: User not participant in conversation
+  - Connection drops handled by client reconnection logic
+
+Acceptance Criteria:
+  ✓ Real-time message delivery to both participants
+  ✓ Non-participants cannot subscribe
+  ✓ Sender receives own message (confirmation)
+  ✓ Handles concurrent messages correctly
+
+Security:
+  - Authorization checked on every subscription
+  - Cannot subscribe to arbitrary conversations
+
+───────────────────────────────────────────────────────────────────────
+
+════════════════════════════════════════════════════════════════════════
+PHASE 2: READ RECEIPTS & PRESENCE (P1)
+════════════════════════════════════════════════════════════════════════
+
+[CHAT-005] Mark Conversation as Read
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    markAsRead(conversationId: ID!): ReadReceipt!
+  }
+  
+  type ReadReceipt {
+    conversationId: ID!
+    userId: String!
+    timestamp: DateTime!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+MongoDB Operations:
+  const timestamp = new Date()
+  await db.conversations.updateOne(
+    { 
+      _id: ObjectId(conversationId),
+      participant_ids: userId
+    },
+    { 
+      $set: { 
+        [`read_status.${userId}`]: timestamp 
+      } 
+    }
+  )
+
+WebSocket Event:
+  - Publish to: `READ_STATUS_CHANGED:${conversationId}`
+  - Payload: { conversationId, userId, timestamp }
+  - Purpose: Other participant sees "Seen at X" update
+
+Business Logic:
+  - Called when user opens conversation or app comes to foreground
+  - Idempotent (can call multiple times safely)
+  - Timestamp represents "last viewed" at conversation level
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant in conversation
+  - 404: Conversation not found
+
+Acceptance Criteria:
+  ✓ Updates read_status for authenticated user
+  ✓ Broadcasts update to other participant
+  ✓ Timestamp reflects server time (not client)
+  ✓ Rejects non-participants
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-006] Get Read Status
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Query {
+    getReadStatus(conversationId: ID!): ReadStatusMap!
+  }
+  
+  type ReadStatusMap {
+    conversationId: ID!
+    status: JSON! # { "userId1": "2024-01-15T10:30:00Z", "userId2": "2024-01-15T10:32:00Z" }
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+MongoDB Operations:
+  const conv = await db.conversations.findOne(
+    { 
+      _id: ObjectId(conversationId),
+      participant_ids: userId
+    },
+    { projection: { read_status: 1 } }
+  )
+
+Business Logic:
+  - Returns read_status map for all participants
+  - Used to display "Seen at X" in UI
+  - Combined with last_message.time_sent to determine if message was seen
+
+Display Logic (Frontend):
+  - If read_status[recipientId] >= last_message.time_sent → "Seen"
+  - Else → "Delivered" or "Sent"
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant
+  - 404: Conversation not found
+
+Acceptance Criteria:
+  ✓ Returns read timestamps for all participants
+  ✓ Only accessible to conversation participants
+  ✓ Efficient query (single document lookup)
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-007] Subscribe to Read Status Changes (WebSocket)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Subscription {
+    readStatusChanged(conversationId: ID!): ReadReceipt!
+  }
+
+Authentication:
+  - Required: userId from WebSocket context
+  - Validates: userId is participant in conversationId
+
+WebSocket Implementation:
+  - Subscribe to: `READ_STATUS_CHANGED:${conversationId}`
+  - Triggered by: CHAT-005 mutation
+  - Delivers: { conversationId, userId, timestamp }
+
+Business Logic:
+  - Real-time "Seen" indicator update
+  - Filters out user's own read events (only notify other participant)
+
+Code Example (resolver):
+  readStatusChanged: {
+    subscribe: withFilter(
+      (_, __, { pubsub }) => pubsub.asyncIterator(['READ_STATUS_CHANGED']),
+      (payload, variables, context) => {
+        return payload.conversationId === variables.conversationId 
+          && payload.userId !== context.userId // Exclude own receipts
+      }
+    )
+  }
+
+Acceptance Criteria:
+  ✓ Real-time delivery of read receipts
+  ✓ User does not receive own read events
+  ✓ Only participants can subscribe
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-008] Update Last Online (Heartbeat)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    updateLastOnline: User!
+  }
+  
+  type User {
+    id: ID!
+    lastOnline: DateTime!
+  }
+
+Authentication:
+  - Required: userId from context
+
+MongoDB Operations:
+  const lastUpdate = await redis.get(`last_online:${userId}`)
+  if (!lastUpdate || Date.now() - lastUpdate > 60000) { // Debounce for 1 minute
+    await db.users.updateOne(
+      { _id: userId },
+      { 
+        $set: { last_online: new Date() },
+        $setOnInsert: { _id: userId }
+      },
+      { upsert: true }
+    )
+    await redis.set(`last_online:${userId}`, Date.now(), 'EX', 300) // Update Redis, expire in 5 min
+  }
+
+WebSocket Event:
+  - Publish to: `USER_STATUS_CHANGED:${userId}`
+  - Payload: { userId, lastOnline }
+  - Purpose: Update "Active now" status for other users
+
+Business Logic:
+  - Called periodically from frontend (heartbeat)
+  - Creates user document if doesn't exist (first-time chat user)
+  - Upsert ensures no error if user not in MongoDB yet
+  - Debounced to reduce database write load
+
+Error Handling:
+  - 401: User not authenticated
+  - 500: Database write failure (log, don't throw)
+
+Acceptance Criteria:
+  ✓ Updates last_online timestamp
+  ✓ Creates user document if missing (upsert)
+  ✓ Debounced to reduce write load
+  ✓ Broadcasts status change
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-009] Get Last Online Status
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Query {
+    getLastOnline(userId: String!): LastOnlineStatus!
+  }
+  
+  type LastOnlineStatus {
+    userId: String!
+    lastOnline: DateTime!
+    isOnline: Boolean!
+  }
+
+Authentication:
+  - Required: userId from context (must be authenticated)
+  - Requires shared conversation: userId from context must be participant in a conversation with target userId
+
+MongoDB Operations:
+  1. Check if requester shares a conversation with target user:
+     const conv = await db.conversations.findOne({
+       participant_ids: { $all: [context.userId, userId] }
+     })
+     if (!conv) throw new Error("Not connected to this user")
+     
+  2. Fetch user's last_online status:
+     const user = await db.users.findOne(
+       { _id: userId },
+       { projection: { last_online: 1 } }
+     )
+
+Business Logic:
+  - isOnline = (Date.now() - last_online) < 120000 (2 minutes)
+  - "Active now" if online, else "Seen at {time}"
+  - Last_online status is only visible to users with whom a conversation exists.
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: No shared conversation (not connected to target user)
+  - 404: Target user not found
+
+Acceptance Criteria:
+  ✓ Returns last online timestamp
+  ✓ Calculates isOnline based on threshold
+  ✓ Only accessible for connected users (shared conversation)
+  ✓ Handles missing user gracefully
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-010] Typing Indicator (WebSocket Only)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    setTyping(conversationId: ID!, isTyping: Boolean!): Boolean!
+  }
+  
+  type Subscription {
+    typingIndicator(conversationId: ID!): TypingStatus!
+  }
+  
+  type TypingStatus {
+    conversationId: ID!
+    userId: String!
+    isTyping: Boolean!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+Implementation:
+  **No database persistence** (typing status is ephemeral)
+  
+  Mutation (setTyping):
+    1. Verify user is participant
+    2. Publish to PubSub: `TYPING:${conversationId}`
+    3. Payload: { conversationId, userId, isTyping }
+    4. Return true
+  
+  Subscription (typingIndicator):
+    1. Verify user is participant
+    2. Subscribe to: `TYPING:${conversationId}`
+    3. Filter out own typing events (payload.userId !== context.userId)
+    4. Deliver to other participant
+
+WebSocket Flow:
+  User A types → setTyping(conversationId, true) → PubSub emits
+  → User B's subscription receives → UI shows "A is typing..."
+  → After 3 seconds of no typing → setTyping(conversationId, false)
+
+Business Logic:
+  - Frontend manages debounce (stop typing after 3s inactivity)
+  - Backend just broadcasts events
+  - No historical record of typing events
+  - Max 1 typing event per 500ms per user (rate limit on mutation)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant
+  - WebSocket disconnection auto-stops typing indicator
+
+Acceptance Criteria:
+  ✓ Real-time typing status delivery
+  ✓ User does not see own typing indicator
+  ✓ No database writes (memory-only)
+  ✓ Properly cleans up on disconnect
+
+Performance:
+  - PubSub must handle burst traffic
+  - Rate limiting on `setTyping` mutation (e.g., max 1 event per 500ms)
+
+───────────────────────────────────────────────────────────────────────
+
+════════════════════════════════════════════════════════════════════════
+PHASE 3: MESSAGE INTERACTIONS (P2)
+════════════════════════════════════════════════════════════════════════
+
+[CHAT-011] Reply to Message
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    replyToMessage(
+      conversationId: ID!
+      replyToMessageId: ID!
+      content: String!
+    ): Message!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in conversationId
+
+MongoDB Operations:
+  1. Verify original message exists and is not unsent:
+     const originalMsg = await db.messages.findOne({
+       _id: ObjectId(replyToMessageId),
+       conversation_id: ObjectId(conversationId)
+     })
+     if (!originalMsg) throw new Error("Original message not found")
+     if (originalMsg.meta.is_unsent) throw new Error("Cannot reply to unsent message")
+     
+  2. Insert reply message (same as CHAT-002 but with meta.reply_to):
+     // (Logic similar to CHAT-002 for determining recipientId and inserting message)
+     await db.messages.insertOne({
+       conversation_id: ObjectId(conversationId),
+       sender_id: userId,
+       recipient_id: recipientId, // determined from conversation participants
+       content: content,
+       time_sent: new Date(),
+       meta: {
+         is_unsent: false,
+         is_forwarded: false,
+         reply_to: ObjectId(replyToMessageId), // Key difference
+         last_edit_at: null
+       },
+       reactions: []
+     })
+     
+  3. Update conversations.last_message
+  4. Publish to MESSAGE_SENT subscription
+
+Business Logic:
+  - Can reply to any message in conversation (even old ones)
+  - Frontend fetches original message separately (see CHAT-012)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant
+  - 404: Original message not found
+  - 400: Cannot reply to unsent message
+
+Acceptance Criteria:
+  ✓ Creates message with reply_to reference
+  ✓ Validates original message exists
+  ✓ Rejects replies to unsent messages
+  ✓ Broadcasts like regular message
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-012] Get Replied Message (for inline preview)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Message {
+    # Existing fields...
+    repliedMessage: Message # Resolver fetches this
+  }
+
+Authentication:
+  - Inherited from parent query (fetchMessages)
+  - Access controlled by parent query (only participants)
+
+Implementation:
+  - Field resolver on Message type
+  - If meta.reply_to exists, fetch that message using DataLoader
+
+MongoDB Operations:
+  // Inside messageLoader DataLoader
+  return await db.messages.find({
+    _id: { $in: messageIds }
+  }).toArray()
+
+Business Logic:
+  - Lazy loaded (only fetches if `meta.reply_to` exists)
+  - Uses DataLoader to prevent N+1 query problem
+  - If original message is unsent (`meta.is_unsent` is true), the resolver should return null for content or a special placeholder.
+
+Error Handling:
+  - Handled by DataLoader (returns null for non-existent messages)
+
+Acceptance Criteria:
+  ✓ Returns original message when reply_to exists
+  ✓ Returns null if no reply reference
+  ✓ Handles unsent original messages gracefully (content hidden)
+  ✓ Uses DataLoader to prevent N+1 queries
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-013] Edit Message
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    editMessage(
+      messageId: ID!
+      newContent: String!
+    ): Message!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is sender of message
+
+MongoDB Operations:
+  1. Verify ownership:
+     const msg = await db.messages.findOne({
+       _id: ObjectId(messageId),
+       sender_id: userId
+     })
+     if (!msg) throw new Error("Message not found or unauthorized")
+     
+  2. Check if already unsent:
+     if (msg.meta.is_unsent) throw new Error("Cannot edit unsent message")
+     
+  3. Update message:
+     await db.messages.updateOne(
+       { _id: ObjectId(messageId) },
+       { $set: {
+         content: newContent,
+         'meta.last_edit_at': new Date()
+       }}
+     )
+     
+  4. If this message is referenced by conversation's `last_message`, update conversation's `last_message.text`:
+     await db.conversations.updateOne(
+       { _id: msg.conversation_id, 'last_message.message_id': ObjectId(messageId) },
+       { $set: { 'last_message.text': newContent.substring(0, 100) }}
+     )
+
+WebSocket Event:
+  - Publish to: `MESSAGE_UPDATED:${conversationId}`
+  - Payload: Updated Message object (including new content and `last_edit_at`)
+  - Purpose: Other participant sees "[Edited]" tag
+
+Business Logic:
+  - Only sender can edit
+  - Cannot edit after unsending
+  - Optional: Implement a time limit for editing (e.g., 15 minutes)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User is not sender
+  - 400: Message is unsent
+  - 404: Message not found
+
+Acceptance Criteria:
+  ✓ Updates message content
+  ✓ Sets last_edit_at timestamp
+  ✓ Updates conversation preview if last message
+  ✓ Broadcasts update to other participant
+  ✓ Only sender can edit
+  ✓ Cannot edit unsent messages
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-014] Unsend Message
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    unsendMessage(messageId: ID!): Message!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is sender of message
+
+MongoDB Operations:
+  1. Verify ownership:
+     const msg = await db.messages.findOne({
+       _id: ObjectId(messageId),
+       sender_id: userId
+     })
+     if (!msg) throw new Error("Message not found or unauthorized")
+     
+  2. Mark as unsent (DO NOT delete message):
+     await db.messages.updateOne(
+       { _id: ObjectId(messageId) },
+       { $set: { 'meta.is_unsent': true }}
+     )
+     
+  3. If this was the most recent message in the conversation, update `last_message` in the conversation:
+     // Find the new "last" message, which is the latest non-unsent message
+     const prevMsg = await db.messages.findOne({
+       conversation_id: msg.conversation_id,
+       'meta.is_unsent': false,
+       time_sent: { $lt: msg.time_sent } // Ensure it's older than the unsent one
+     }, { sort: { time_sent: -1 } })
+       
+     await db.conversations.updateOne(
+       { _id: msg.conversation_id },
+       { $set: { 
+           last_message: prevMsg ? {
+             sender_id: prevMsg.sender_id,
+             text: prevMsg.content.substring(0, 100),
+             time_sent: prevMsg.time_sent,
+             message_id: prevMsg._id
+           } : null // If no previous message, last_message becomes null
+         }
+       }
+     )
+
+WebSocket Event:
+  - Publish to: `MESSAGE_UPDATED:${conversationId}`
+  - Payload: Message with `is_unsent: true`
+  - Frontend displays: "[Message unsent]"
+
+Business Logic:
+  - Only sender can unsend
+  - Optional: Implement a time limit for unsending (e.g., 24 hours)
+  - Unsent messages still count in conversation (preserve gaps)
+  - Cannot unsend twice (idempotent—already unsent)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User is not sender
+  - 404: Message not found
+
+Acceptance Criteria:
+  ✓ Sets is_unsent flag (does not delete message)
+  ✓ Updates last_message in conversation if this was the previous last message
+  ✓ Broadcasts update to other participant
+  ✓ Only sender can unsend
+  ✓ Message persists in database, but content is hidden
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-015] Subscribe to Message Updates (WebSocket)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Subscription {
+    messageUpdated(conversationId: ID!): Message!
+  }
+
+Authentication:
+  - Required: userId from WebSocket context
+  - Validates: userId is participant in conversationId
+
+WebSocket Implementation:
+  - Subscribe to: `MESSAGE_UPDATED:${conversationId}`
+  - Triggered by: CHAT-013 (edit), CHAT-014 (unsend)
+  - Delivers: Full updated Message object
+
+Business Logic:
+  - Client receives updates for edited/unsent messages
+  - Client should:
+    * Replace message in local cache if edited
+    * Hide content if unsent
+  - Sender receives own updates (for multi-device sync)
+
+Acceptance Criteria:
+  ✓ Delivers edit/unsend events in real-time
+  ✓ Only participants can subscribe
+  ✓ Works for both sender and recipient
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-016] Add Reaction
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    addReaction(
+      messageId: ID!
+      reactionType: Int!
+    ): Message!
+  }
+  
+  type Reaction {
+    userId: String!
+    type: Int! # 1-6 (e.g., 👍 ❤️ 😂 😮 😢 😡)
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in message's conversation
+
+MongoDB Operations:
+  1. Verify message exists and user is participant:
+     const msg = await db.messages.findOne({ _id: ObjectId(messageId) })
+     const conv = await db.conversations.findOne({
+       _id: msg.conversation_id,
+       participant_ids: userId
+     })
+     if (!msg || !conv) throw new Error("Message or conversation not found, or unauthorized")
+     
+  2. Update reactions array (replace if user already reacted, otherwise add):
+     await db.messages.updateOne(
+       { _id: ObjectId(messageId) },
+       [{ $set: {
+         reactions: {
+           $concatArrays: [
+             { $filter: {
+               input: "$reactions",
+               cond: { $ne: ["$this.user_id", userId] }
+             }},
+             [{ user_id: userId, type: reactionType }]
+           ]
+         }
+       }}]
+     )
+
+WebSocket Event:
+  - Publish to: `REACTION_UPDATED:${conversationId}`
+  - Payload: { messageId, reactions: [...] } (full updated reactions array for the message)
+
+Business Logic:
+  - User can have only one reaction type per message
+  - Changing reaction removes old one
+  - reactionType must be within defined range (1-6)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant
+  - 400: Invalid reactionType (not in range 1-6)
+  - 404: Message not found
+
+Acceptance Criteria:
+  ✓ Adds reaction to message
+  ✓ Replaces existing reaction if user already reacted
+  ✓ Validates reaction type range
+  ✓ Broadcasts update in real-time
+  ✓ Only participants can react
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-017] Remove Reaction
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    removeReaction(messageId: ID!): Message!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: userId is participant in message's conversation
+
+MongoDB Operations:
+  1. Verify message exists and user is participant (same as CHAT-016)
+  2. Remove user's reaction:
+     await db.messages.updateOne(
+       { _id: ObjectId(messageId) },
+       { $pull: { reactions: { user_id: userId } }}
+     )
+
+WebSocket Event:
+  - Publish to: `REACTION_UPDATED:${conversationId}`
+  - Same as CHAT-016
+
+Business Logic:
+  - Removes all reactions from user (in case of duplicates, though logic in CHAT-016 prevents this)
+  - Idempotent (safe to call even if no reaction exists)
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant
+  - 404: Message not found
+
+Acceptance Criteria:
+  ✓ Removes user's reaction
+  ✓ Broadcasts update
+  ✓ Idempotent operation
+
+───────────────────────────────────────────────────────────────────────
+
+[CHAT-018] Subscribe to Reaction Updates (WebSocket)
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Subscription {
+    reactionUpdated(conversationId: ID!): ReactionUpdate!
+  }
+  
+  type ReactionUpdate {
+    messageId: ID!
+    reactions: [Reaction!]!
+  }
+
+Authentication:
+  - Required: userId from WebSocket context
+  - Validates: userId is participant in conversationId
+
+WebSocket Implementation:
+  - Publish (from CHAT-016/017) includes `conversationId` in payload
+  - Subscription filters by `conversationId`
+  - Client updates specific message in local cache
+
+Code Example (resolver):
+  reactionUpdated: {
+    subscribe: withFilter(
+      (_, __, { pubsub }) => pubsub.asyncIterator(['REACTION_UPDATED']),
+      async (payload, variables, context) => {
+        // Verify user is participant
+        const conv = await db.conversations.findOne({
+          _id: ObjectId(variables.conversationId),
+          participant_ids: context.userId
+        })
+        return conv && payload.conversationId === variables.conversationId
+      }
+    )
+  }
+
+Acceptance Criteria:
+  ✓ Delivers reaction changes in real-time
+  ✓ Efficient (one subscription per conversation)
+  ✓ Works for all messages in conversation
+
+───────────────────────────────────────────────────────────────────────
+
+════════════════════════════════════════════════════════════════════════
+PHASE 4: ADVANCED FEATURES (P3)
+════════════════════════════════════════════════════════════════════════
+
+[CHAT-019] Forward Message
+───────────────────────────────────────────────────────────────────────
+GraphQL Schema:
+  type Mutation {
+    forwardMessage(
+      messageId: ID!
+      toConversationId: ID!
+    ): Message!
+  }
+
+Authentication:
+  - Required: userId from context
+  - Validates: 
+    * userId is participant in source conversation (of messageId)
+    * userId is participant in target conversation (toConversationId)
+
+MongoDB Operations:
+  1. Fetch original message:
+     const originalMsg = await db.messages.findOne({
+       _id: ObjectId(messageId)
+     })
+     if (!originalMsg) throw new Error("Original message not found")
+     
+  2. Verify user is participant in both conversations:
+     const sourceConv = await db.conversations.findOne({
+       _id: originalMsg.conversation_id,
+       participant_ids: userId
+     })
+     const targetConv = await db.conversations.findOne({
+       _id: ObjectId(toConversationId),
+       participant_ids: userId
+     })
+     if (!sourceConv || !targetConv) throw new Error("Unauthorized to forward message to/from these conversations")
+
+  3. Check for unsent message:
+     if (originalMsg.meta.is_unsent) throw new Error("Cannot forward unsent message")
+     
+  4. Create new message in target conversation:
+     const recipientId = targetConv.participant_ids.find(id => id !== userId) // Recipient in the target conversation
+     
+     await db.messages.insertOne({
+       conversation_id: ObjectId(toConversationId),
+       sender_id: userId, // Current user, NOT original sender
+       recipient_id: recipientId,
+       content: originalMsg.content, // Copy content only
+       time_sent: new Date(),
+       meta: {
+         is_unsent: false,
+         is_forwarded: true, // Mark as forwarded
+         reply_to: null, // Don't copy reply reference
+         last_edit_at: null
+       },
+       reactions: [] // Don't copy reactions
+     })
+     
+  5. Update target conversation's last_message
+  6. Publish to MESSAGE_SENT for target conversation
+
+Business Logic:
+  - Content copied but metadata (senderId, replyTo, reactions) reset
+  - Original sender info NOT preserved
+  - Frontend displays: "🔄 Forwarded" badge
+  - Can forward to multiple conversations (client calls mutation multiple times)
+  - Cannot forward unsent messages
+
+Error Handling:
+  - 401: User not authenticated
+  - 403: User not participant in source or target conversation
+  - 400: Cannot forward unsent message
+  - 404: Message or conversation not found
+
+Acceptance Criteria:
+  ✓ Creates new message in target conversation
+  ✓ Sets is_forwarded flag
+  ✓ Does NOT copy original sender info, reactions, or reply-to
+  ✓ User must be participant in both conversations
+  ✓ Broadcasts like regular message
+
+───────────────────────────────────────────────────────────────────────
+
+════════════════════════════════════════════════════════════════════════
+IMPLEMENTATION ORDER (Dependency-Based)
+════════════════════════════════════════════════════════════════════════
+
+Sprint 1 (Week 1-2): Core Infrastructure
+  [CHAT-001] Create Conversation
+  [CHAT-002] Send Message
+  [CHAT-003] Fetch Messages
+  [CHAT-004] Subscribe to New Messages
+  → Deliverable: Basic 1-1 chat working
+
+Sprint 2 (Week 3): Read Receipts & Presence
+  [CHAT-005] Mark as Read
+  [CHAT-006] Get Read Status
+  [CHAT-007] Subscribe to Read Status
+  [CHAT-008] Update Last Online
+  [CHAT-009] Get Last Online
+  [CHAT-010] Typing Indicator
+  → Deliverable: "Seen at X", "Active now", typing indicators
+
+Sprint 3 (Week 4-5): Message Interactions
+  [CHAT-011] Reply to Message
+  [CHAT-012] Get Replied Message (DataLoader)
+  [CHAT-013] Edit Message
+  [CHAT-014] Unsend Message
+  [CHAT-015] Subscribe to Message Updates
+  → Deliverable: Edit/Unsend/Reply features
+
+Sprint 4 (Week 6): Reactions
+  [CHAT-016] Add Reaction
+  [CHAT-017] Remove Reaction
+  [CHAT-018] Subscribe to Reaction Updates
+  → Deliverable: Message reactions
+
+Sprint 5 (Week 7): Advanced Features
+  [CHAT-019] Forward Message
+  → Deliverable: Message forwarding
+
+════════════════════════════════════════════════════════════════════════
+ADDITIONAL REQUIREMENTS
+════════════════════════════════════════════════════════════════════════
+
+Database Indexes (Create Before Sprint 1):
+  db.conversations.createIndex({ participant_ids: 1 })
+  db.messages.createIndex({ conversation_id: 1, time_sent: -1 })
+  db.messages.createIndex({ _id: 1, sender_id: 1 }) // For ownership checks
+  db.users.createIndex({ _id: 1 })
+
+File Structure Updates:
+  Backend/
+  ├── src/
+  │   ├── db/
+  │   │   ├── sql/db.js
+  │   │   └── nosql/db.js          [NEW]
+  │   ├── models/
+  │   │   ├── UserCore.js
+  │   │   ├── Conversation.js            [NEW]
+  │   │   ├── Message.js                 [NEW]
+  │   │   └── User.js (MongoDB schema)   [NEW]
+  │   ├── graphql/
+  │   │   ├── schemas/
+  │   │   │   ├── userSchema.js
+  │   │   │   ├── conversationSchema.js  [NEW]
+  │   │   │   └── messageSchema.js       [NEW]
+  │   │   └── resolvers/
+  │   │       ├── userResolver.js
+  │   │       ├── conversationResolver.js [NEW]
+  │   │       ├── messageResolver.js     [NEW]
+  │   │       └── subscriptions.js       [NEW]
+  │   ├── loaders/
+  │   │   └── messageLoader.js           [NEW - DataLoader for CHAT-012]
+  │   └── pubsub/
+  │       └── events.js                  [NEW - PubSub topics]
+
+Technology Stack:
+  - MongoDB: v6.0+
+  - mongoose: ^7.0.0 (for schemas)
+  - apollo-server-express: ^3.12.0
+  - graphql-subscriptions: ^2.0.0
+  - dataloader: ^2.2.2
+
+Environment Variables:
+  MONGODB_URI=mongodb://localhost:27017/chat_app
+  REDIS_URL=redis://localhost:6379
+  SQL_DATABASE_URL=postgresql://...
+
+Testing Requirements (Per Ticket):
+  - Unit tests: Resolver logic
+  - Integration tests: MongoDB operations
+  - E2E tests: WebSocket subscriptions
+  - Load tests: 1000 concurrent users, 100 msg/sec
+
+Performance Benchmarks:
+  - Message send latency: <100ms (p95)
+  - WebSocket delivery: <50ms (p95)
+  - Fetch messages: <200ms for 1000 messages
+  - Typing indicator: <30ms delivery
+
+Security Checklist:
+  ✓ All mutations validate userId from auth context
+  ✓ All queries check participant membership
+  ✓ Input sanitization (XSS prevention in content)
+  ✓ Rate limiting on mutations (prevent spam)
+  ✓ WebSocket authentication required
+
+════════════════════════════════════════════════════════════════════════
