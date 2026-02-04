@@ -28,6 +28,8 @@ const { closePool } = require('./src/db/sql/db.js');
 const { connectMongoDB, closeMongoConnection } = require('./src/db/nosql/db.js');
 const { createIndexes } = require('./src/db/nosql/indexes.js');
 
+const { createMessageLoader } = require('./src/loaders/messageLoader.js');
+
 dotenv.config();
 
 const PORT = process.env.PORT || 4000;
@@ -39,24 +41,15 @@ const NODE_ENV = process.env.NODE_ENV || 'development';
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 if (!SESSION_SECRET) {
-  console.error('SESSION_SECRET not set in environment.');
-  console.error('Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
   process.exit(1);
 }
 
 if (!pubsub) {
-  console.error('PubSub instance is undefined after import.');
   process.exit(1);
 }
 if (typeof pubsub.asyncIterator !== 'function' || typeof pubsub.publish !== 'function') {
-  console.error('PubSub instance is invalid or not properly initialized.');
-  console.error(`- Type of pubsub: ${typeof pubsub}`);
-  console.error(`- Has asyncIterator: ${typeof pubsub.asyncIterator === 'function'}`);
-  console.error(`- Has publish: ${typeof pubsub.publish === 'function'}`);
-  console.error('Check ./src/pubsub/events.js exports.');
   process.exit(1);
 }
-console.log('PubSub instance validated.');
 
 const app = express();
 const httpServer = http.createServer(app);
@@ -67,20 +60,18 @@ const redisClient = createClient({
     port: REDIS_PORT,
     reconnectStrategy: (retries) => {
       if (retries > 10) {
-        console.error('Redis reconnection failed after 10 attempts');
         return new Error('Redis connection failed');
       }
       const delay = Math.min(retries * 100, 3000);
-      console.log(`Redis reconnecting in ${delay}ms (attempt ${retries})`);
       return delay;
     }
   }
 });
 
-redisClient.on('error', (err) => console.error('Redis Client Error:', err));
-redisClient.on('connect', () => console.log('Redis client connecting...'));
-redisClient.on('ready', () => console.log('Redis client connected and ready'));
-redisClient.on('reconnecting', () => console.log('Redis client reconnecting...'));
+redisClient.on('error', (err) => { });
+redisClient.on('connect', () => { });
+redisClient.on('ready', () => { });
+redisClient.on('reconnecting', () => { });
 
 const redisStore = new RedisStore({
   client: redisClient,
@@ -119,7 +110,6 @@ async function getSessionFromWebSocket(ctx) {
   const cookieHeader = ctx.extra?.request?.headers?.cookie;
 
   if (!cookieHeader) {
-    console.log('No cookies found in WebSocket request.');
     return { user: null };
   }
 
@@ -132,7 +122,6 @@ async function getSessionFromWebSocket(ctx) {
   const sessionId = cookies['connect.sid'];
 
   if (!sessionId) {
-    console.log('No connect.sid cookie found.');
     return { user: null };
   }
 
@@ -143,11 +132,9 @@ async function getSessionFromWebSocket(ctx) {
   return new Promise((resolve) => {
     redisStore.get(unsignedSessionId, async (err, session) => {
       if (err) {
-        console.error('Error retrieving session from Redis:', err);
         return resolve({ user: null });
       }
       if (!session || !session.userId) {
-        console.log('Session not found or no userId in session.');
         return resolve({ user: null });
       }
 
@@ -156,7 +143,6 @@ async function getSessionFromWebSocket(ctx) {
         const user = await findUserById(session.userId);
         resolve({ user });
       } catch (error) {
-        console.error('Error loading user in WebSocket context:', error);
         resolve({ user: null });
       }
     });
@@ -176,15 +162,10 @@ const wsServer = new WebSocketServer({
 const serverCleanup = useServer({
   schema,
   onConnect: async (ctx) => {
-    console.log('WebSocket connection initiated.');
-
     const { user } = await getSessionFromWebSocket(ctx);
 
     if (user) {
-      console.log(`WebSocket authenticated: ${user.username} (ID: ${user.id})`);
       ctx.extra.user = user;
-    } else {
-      console.log('WebSocket connected without authentication. Subscriptions requiring auth will fail.');
     }
     return true;
   },
@@ -195,35 +176,27 @@ const serverCleanup = useServer({
     return {
       user,
       pubsub,
-      redisClient
+      redisClient,
+      messageLoader: createMessageLoader()
     };
   },
 
   onSubscribe: (ctx, msg) => {
     const query = msg.payload?.query || msg.query || 'Unknown Subscription Query';
     const operationName = msg.payload?.operationName || 'N/A';
-    console.log(`Subscription started: Operation "${operationName}"`);
-    console.log(`Query preview: ${query.substring(0, 60).replace(/\n/g, ' ')}...`);
   },
 
   onComplete: (ctx, msg) => {
-    console.log('Subscription completed.');
   },
 
   onError: (ctx, msg, errors) => {
-    console.error('WebSocket Subscription Error:', errors);
   }
 }, wsServer);
 
 wsServer.on('connection', (ws, request) => {
-  console.log('Raw WebSocket connection established.');
-  console.log(' - URL:', request.url);
-  console.log(' - Origin:', request.headers.origin);
-  console.log(' - Protocols:', request.headers['sec-websocket-protocol']);
-  console.log(' - Cookies:', request.headers.cookie ? 'Present' : 'Missing');
 });
-wsServer.on('error', (error) => console.error('WebSocket Server Error:', error));
-wsServer.on('close', () => console.log('WebSocket server closed.'));
+wsServer.on('error', (error) => { });
+wsServer.on('close', () => { });
 
 const apolloServer = new ApolloServer({
   schema,
@@ -248,7 +221,6 @@ const apolloServer = new ApolloServer({
   introspection: NODE_ENV !== 'production',
 
   formatError: (formattedError, error) => {
-    console.error('GraphQL Error Details:', error);
 
     if (NODE_ENV === 'production') {
       if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR' || formattedError.message.includes('Internal server error')) {
@@ -264,21 +236,14 @@ const apolloServer = new ApolloServer({
 
 async function startServer() {
   try {
-    console.log('Starting GraphQL Authentication + Chat Server...\n');
 
-    console.log('Connecting to Redis...');
     await redisClient.connect();
 
-    console.log('Connecting to MongoDB...');
     await connectMongoDB();
 
-    console.log('Creating MongoDB indexes...');
     await createIndexes();
 
-    console.log('Initializing Apollo Server...');
     await apolloServer.start();
-
-    console.log('Configuring Express middleware...\n');
 
     app.use(express.json());
     app.use(express.urlencoded({ extended: true }));
@@ -293,7 +258,8 @@ async function startServer() {
           return {
             ...context,
             pubsub,
-            redisClient
+            redisClient,
+            messageLoader: createMessageLoader()
           };
         }
       })
@@ -316,74 +282,31 @@ async function startServer() {
     });
 
     httpServer.listen(PORT, () => {
-      console.log('Server started successfully!\n');
-      console.log('Server Information:');
-      console.log(`- GraphQL HTTP: http://localhost:${PORT}/graphql`);
-      console.log(`- GraphQL WebSocket: ws://localhost:${PORT}/graphql`);
-      console.log(`- GraphQL Playground: http://localhost:${PORT}/graphql`);
-      console.log(`- Health Check: http://localhost:${PORT}/health`);
-      console.log(`- Environment: ${NODE_ENV}`);
-      console.log(`- Redis: ${REDIS_HOST}:${REDIS_PORT}`);
-      console.log(`- MongoDB: ${process.env.MONGODB_URI ? 'Configured' : 'Not configured'}`);
-      console.log(`- Session Duration: ${SESSION_MAX_AGE / 1000 / 60 / 60 / 24} days\n`);
-
-      console.log('Security Configuration:');
-      console.log(`- HttpOnly Cookies: `);
-      console.log(`- Secure Cookies: ${NODE_ENV === 'production' ? '' : '(disabled in dev)'}`);
-      console.log(`- SameSite Policy: Lax`);
-      console.log(`- WebSocket Auth: Cookie-based`);
-      console.log(`- Bcrypt Salt Rounds: 12`);
-      console.log(`- Session Store: Redis`);
-      console.log(`- CORS Origin: ${corsOptions.origin}\n`);
-
-      console.log('Chat Features (Phase 1):');
-      console.log('Create 1-on-1 conversations');
-      console.log('Send real-time messages');
-      console.log('Cursor-based pagination');
-      console.log('WebSocket subscriptions\n');
-
-      console.log('Quick Start Guide:');
-      console.log('1. Open http://localhost:4000/graphql in your browser');
-      console.log('2. Enable "Request Credentials" in Playground settings');
-      console.log('3. Run login mutation to authenticate');
-      console.log('4. Run createConversation to start chat');
-      console.log('5. Open subscription tab and subscribe to messageReceived');
-      console.log('6. Run sendMessage to test real-time delivery\n');
     });
 
   } catch (error) {
-    console.error('Server startup failed:', error);
     process.exit(1);
   }
 }
 
 async function shutdown(signal) {
-  console.log(`\nReceived ${signal}, shutting down gracefully...`);
 
   try {
     await apolloServer.stop();
-    console.log('Apollo Server stopped.');
 
     await serverCleanup.dispose();
-    console.log('WebSocket server closed.');
 
     await new Promise((resolve) => httpServer.close(resolve));
-    console.log('HTTP server closed.');
 
     await redisClient.disconnect();
-    console.log('Redis disconnected.');
 
     await closeMongoConnection();
-    console.log('MongoDB disconnected.');
 
     await closePool();
-    console.log('SQL Server pool closed.');
 
-    console.log('Shutdown complete. Exiting process.');
     process.exit(0);
 
   } catch (error) {
-    console.error('Error during shutdown:', error);
     process.exit(1);
   }
 }
@@ -391,11 +314,9 @@ async function shutdown(signal) {
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
   shutdown('uncaughtException');
 });
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
   shutdown('unhandledRejection');
 });
 

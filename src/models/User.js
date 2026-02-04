@@ -16,8 +16,6 @@ const userSchema = new mongoose.Schema({
     collection: 'users'
 });
 
-userSchema.index({ _id: 1 });
-
 userSchema.statics.updateLastOnline = async function (userId) {
     const timestamp = new Date();
     await this.updateOne(
@@ -38,4 +36,4 @@ userSchema.methods.isOnline = function () {
 
 const User = mongoose.model('User', userSchema);
 
-module.exports = User;
+module.exports = User;  

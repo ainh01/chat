@@ -10,3 +10,315 @@ SecurePass123!
 
 6982ac76d485c5338cc8d622
 
+# 🐛 Bug Fixes: Unsend, Reactions, and GraphQL Query  
+
+## Bug 1: Unsend Message - Missing Field Resolver  
+
+**Root Cause:** The `meta` field contains snake_case keys from MongoDB (`is_unsent`, `is_forwarded`, etc.) but GraphQL schema expects camelCase (`isUnsent`, `isForwarded`).  
+
+### Fix: Add `meta` field resolver  
+
+**File:** `src/graphql/resolvers/conversationResolver.js`  
+
+**FIND this section (around line 60):**  
+
+```javascript  
+  Message: {  
+    content(parent) {  
+      if (parent.meta?.is_unsent) {  
+        return null;  
+      }  
+      return parent.content;  
+    },  
+
+    id(parent) {  
+      return parent._id.toString();  
+    },  
+```  
+
+**ADD this resolver after `timeSent` (around line 85):**  
+
+```javascript  
+    timeSent(parent) {  
+      return parent.time_sent;  
+    },  
+
+    // ========== FIX: Transform meta fields from snake_case to camelCase ==========  
+    meta(parent) {  
+      if (!parent.meta) {  
+        return {  
+          isUnsent: false,  
+          isForwarded: false,  
+          replyTo: null,  
+          lastEditAt: null  
+        };  
+      }  
+
+      return {  
+        isUnsent: parent.meta.is_unsent || false,  
+        isForwarded: parent.meta.is_forwarded || false,  
+        replyTo: parent.meta.reply_to || null,  
+        lastEditAt: parent.meta.last_edit_at || null  
+      };  
+    },  
+
+    reactions(parent) {  
+      if (!parent.reactions || !Array.isArray(parent.reactions)) {  
+        return [];  
+      }  
+
+      return parent.reactions.map(reaction => ({  
+        userId: reaction.user_id,  
+        type: reaction.type  
+      }));  
+    },  
+
+    // ========== CHAT-012: DataLoader field resolver ==========  
+    async repliedMessage(parent, _, context) {  
+```  
+
+---  
+
+## Bug 2: Add Reaction - Missing Pipeline Option  
+
+**Root Cause:** `Message.updateOne()` doesn't accept aggregation pipeline syntax (array) by default in Mongoose 6+.  
+
+### Fix: Add `{ timestamps: false }` option to enable pipeline  
+
+**File:** `src/graphql/resolvers/conversationResolver.js`  
+
+**FIND (around line 686):**  
+
+```javascript  
+      // Atomic update: remove old reaction + add new reaction  
+      await Message.updateOne(  
+        { _id: message._id },  
+        [  
+          {  
+            $set: {  
+              reactions: {  
+                $concatArrays: [  
+                  {  
+                    $filter: {  
+                      input: '$reactions',  
+                      cond: { $ne: ['$$this.user_id', user.id] }  
+                    }  
+                  },  
+                  [{ user_id: user.id, type: reactionType }]  
+                ]  
+              }  
+            }  
+          }  
+        ]  
+      );  
+```  
+
+**REPLACE WITH:**  
+
+```javascript  
+      // Atomic update: remove old reaction + add new reaction  
+      await Message.updateOne(  
+        { _id: message._id },  
+        [  
+          {  
+            $set: {  
+              reactions: {  
+                $concatArrays: [  
+                  {  
+                    $filter: {  
+                      input: '$reactions',  
+                      cond: { $ne: ['$$this.user_id', user.id] }  
+                    }  
+                  },  
+                  [{ user_id: user.id, type: reactionType }]  
+                ]  
+              }  
+            }  
+          }  
+        ],  
+        { timestamps: false }  // ← ADD THIS to enable aggregation pipeline  
+      );  
+```  
+
+---  
+
+## Bug 3: Forward Message - Client Query Syntax Error  
+
+**Root Cause:** This is a **client-side error**, not a server bug. GraphQL requires specifying subfields for object types.  
+
+### Fix: Update Client Query  
+
+**WRONG:**  
+```graphql  
+mutation {  
+  forwardMessage(  
+    messageId: "SOURCE_MESSAGE_ID"  
+    toConversationId: "TARGET_CONVERSATION_ID"  
+  ) {  
+    id  
+    content  
+    senderId  
+    meta {  
+      isForwarded  
+      replyTo  
+    }  
+    reactions  # ❌ ERROR: Must specify subfields  
+  }  
+}  
+```  
+
+**CORRECT:**  
+```graphql  
+mutation {  
+  forwardMessage(  
+    messageId: "674acc3e7c7427cfdb987654"  
+    toConversationId: "674acc3e7c7427cfdb423456"  
+  ) {  
+    id  
+    content  
+    senderId  
+    meta {  
+      isForwarded  
+      replyTo  
+    }  
+    reactions {  # ✅ FIXED: Added subfields  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+---  
+
+## Complete Updated Test Queries  
+
+### Test Unsend (Bug 1 Fix)  
+
+```graphql  
+mutation {  
+  unsendMessage(messageId: "674acc3e7c7427cfdb987654") {  
+    id  
+    content  # Should return null  
+    meta {  
+      isUnsent  # Should be true  
+      lastEditAt  
+    }  
+  }  
+}  
+```  
+
+**Expected Response:**  
+```json  
+{  
+  "data": {  
+    "unsendMessage": {  
+      "id": "674acc3e7c7427cfdb987654",  
+      "content": null,  
+      "meta": {  
+        "isUnsent": true,  
+        "lastEditAt": null  
+      }  
+    }  
+  }  
+}  
+```  
+
+---  
+
+### Test Add Reaction (Bug 2 Fix)  
+
+```graphql  
+mutation {  
+  addReaction(messageId: "674acc3e7c7427cfdb987654", reactionType: 1) {  
+    id  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Expected Response:**  
+```json  
+{  
+  "data": {  
+    "addReaction": {  
+      "id": "674acc3e7c7427cfdb987654",  
+      "reactions": [  
+        {  
+          "userId": "674acc3e7c7427cfdb111111",  
+          "type": 1  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+---  
+
+### Test Forward Message (Bug 3 Fix)  
+
+```graphql  
+mutation {  
+  forwardMessage(  
+    messageId: "674acc3e7c7427cfdb987654"  
+    toConversationId: "674acc3e7c7427cfdb423456"  
+  ) {  
+    id  
+    content  
+    senderId  
+    meta {  
+      isForwarded  
+      replyTo  
+      isUnsent  
+    }  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Expected Response:**  
+```json  
+{  
+  "data": {  
+    "forwardMessage": {  
+      "id": "674bcd4e8d8538dfeb111111",  
+      "content": "Original message content",  
+      "senderId": "674acc3e7c7427cfdb222222",  
+      "meta": {  
+        "isForwarded": true,  
+        "replyTo": null,  
+        "isUnsent": false  
+      },  
+      "reactions": []  
+    }  
+  }  
+}  
+```  
+
+---  
+
+## Summary of Changes  
+
+| Bug | Location | Fix |  
+|-----|----------|-----|  
+| **Bug 1** | `conversationResolver.js` | Added `meta` and `reactions` field resolvers to transform snake_case → camelCase |  
+| **Bug 2** | `addReaction` mutation | Added `{ timestamps: false }` option to `updateOne()` for pipeline support |  
+| **Bug 3** | Client query | Changed `reactions` to `reactions { userId type }` (no server change needed) |  
+
+---  
+
+## Verification Steps  
+
+1. **Restart server** (no need to reinstall packages)  
+2. **Test unsend** - should return `isUnsent: true` without errors  
+3. **Test reactions** - should add/update reactions atomically  
+4. **Test forward** - use corrected query syntax with subfields  
+
+All three bugs should now be resolved! 🎉

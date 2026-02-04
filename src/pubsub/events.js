@@ -1,17 +1,17 @@
 const { PubSub } = require('graphql-subscriptions');
-
 const pubsub = new PubSub();
-
 const MESSAGE_SENT = 'MESSAGE_SENT';
-
 const READ_STATUS_CHANGED = 'READ_STATUS_CHANGED';
 const USER_STATUS_CHANGED = 'USER_STATUS_CHANGED';
 const TYPING = 'TYPING';
-
+const MESSAGE_UPDATED = 'MESSAGE_UPDATED';
+const REACTION_UPDATED = 'REACTION_UPDATED';
 module.exports = {
   pubsub,
   MESSAGE_SENT,
   READ_STATUS_CHANGED,
   USER_STATUS_CHANGED,
-  TYPING
+  TYPING,
+  MESSAGE_UPDATED,
+  REACTION_UPDATED
 };

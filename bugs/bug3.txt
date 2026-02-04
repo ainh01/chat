@@ -1,0 +1,53 @@
+1. Forward Message (CHAT-019)
+
+client sent:
+
+graphql
+mutation {  
+  forwardMessage(  
+    messageId: "SOURCE_MESSAGE_ID"  
+    toConversationId: "TARGET_CONVERSATION_ID"  
+  ) {  
+    id  
+    content  
+    senderId  # Should be YOUR user ID  
+    meta {  
+      isForwarded  # Should be true  
+      replyTo  # Should be null  
+    }  
+    reactions  # Should be empty array  
+  }  
+}  
+
+client received:
+{
+  "error": {
+    "errors": [
+      {
+        "message": "Field \"reactions\" of type \"[Reaction!]!\" must have a selection of subfields. Did you mean \"reactions { ... }\"?",
+        "locations": [
+          {
+            "line": 13,
+            "column": 5
+          }
+        ],
+        "extensions": {
+          "code": "GRAPHQL_VALIDATION_FAILED",
+          "stacktrace": [
+            "GraphQLError: Field \"reactions\" of type \"[Reaction!]!\" must have a selection of subfields. Did you mean \"reactions { ... }\"?",
+            "    at Object.Field (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\graphql\\validation\\rules\\ScalarLeafsRule.js:44:13)",
+            "    at Object.enter (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\graphql\\language\\visitor.js:298:32)",
+            "    at Object.enter (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\graphql\\utilities\\TypeInfo.js:391:27)",
+            "    at visit (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\graphql\\language\\visitor.js:194:21)",
+            "    at validate (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\graphql\\validation\\validate.js:91:24)",
+            "    at processGraphQLRequest (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\@apollo\\server\\dist\\cjs\\requestPipeline.js:101:59)",
+            "    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)",
+            "    at async internalExecuteOperation (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\@apollo\\server\\dist\\cjs\\ApolloServer.js:647:16)",
+            "    at async runHttpQuery (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\@apollo\\server\\dist\\cjs\\runHttpQuery.js:135:29)",
+            "    at async runPotentiallyBatchedHttpQuery (C:\\Users\\Ainh\\Desktop\\dev\\chat\\node_modules\\@apollo\\server\\dist\\cjs\\httpBatching.js:37:16)"
+          ]
+        }
+      }
+    ]
+  }
+}

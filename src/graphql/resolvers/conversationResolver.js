@@ -9,9 +9,12 @@ const {
   MESSAGE_SENT,
   READ_STATUS_CHANGED,
   USER_STATUS_CHANGED,
-  TYPING
+  TYPING,
+  MESSAGE_UPDATED,
+  REACTION_UPDATED
 } = require('../../pubsub/events');
 const { withFilter } = require('graphql-subscriptions');
+const mongoose = require('mongoose');
 
 const conversationResolvers = {
   DateTime: {
@@ -80,6 +83,60 @@ const conversationResolvers = {
 
     timeSent(parent) {
       return parent.time_sent;
+    },
+    meta(parent) {
+      if (!parent.meta) {
+        return {
+          isUnsent: false,
+          isForwarded: false,
+          replyTo: null,
+          lastEditAt: null
+        };
+      }
+
+      return {
+        isUnsent: parent.meta.is_unsent || false,
+        isForwarded: parent.meta.is_forwarded || false,
+        replyTo: parent.meta.reply_to || null,
+        lastEditAt: parent.meta.last_edit_at || null
+      };
+    },
+
+    reactions(parent) {
+      if (!parent.reactions || !Array.isArray(parent.reactions)) {
+        return [];
+      }
+
+      return parent.reactions.map(reaction => ({
+        userId: reaction.user_id,
+        type: reaction.type
+      }));
+    },
+
+    async repliedMessage(parent, _, context) {
+      if (!parent.meta?.reply_to) {
+        return null;
+      }
+
+      const { messageLoader } = context;
+      if (!messageLoader) {
+        return null;
+      }
+
+      const originalMessage = await messageLoader.load(parent.meta.reply_to.toString());
+
+      if (!originalMessage) {
+        return null;
+      }
+
+      if (originalMessage.meta?.is_unsent) {
+        return {
+          ...originalMessage,
+          content: null
+        };
+      }
+
+      return originalMessage;
     }
   },
 
@@ -385,6 +442,449 @@ const conversationResolvers = {
       return message;
     },
 
+    async replyToMessage(_, { conversationId, replyToMessageId, content }, context) {
+      const user = requireAuth(context);
+
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId);
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      let originalMessage;
+      try {
+        originalMessage = await Message.findOne({
+          _id: replyToMessageId,
+          conversation_id: conversation._id
+        });
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!originalMessage) {
+        throw new GraphQLError('Original message not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (originalMessage.meta.is_unsent) {
+        throw new GraphQLError('Cannot reply to unsent message', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      const trimmedContent = content.trim();
+
+      if (trimmedContent.length === 0) {
+        throw new GraphQLError('Message content cannot be empty', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (trimmedContent.length > 5000) {
+        throw new GraphQLError('Message content exceeds maximum length', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      const recipientId = conversation.participant_ids.find(id => id !== user.id);
+
+      const message = new Message({
+        conversation_id: conversation._id,
+        sender_id: user.id,
+        recipient_id: recipientId,
+        content: trimmedContent,
+        time_sent: new Date(),
+        meta: {
+          is_unsent: false,
+          is_forwarded: false,
+          reply_to: originalMessage._id,
+          last_edit_at: null
+        },
+        reactions: []
+      });
+
+      await message.save();
+
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        {
+          $set: {
+            last_message: {
+              sender_id: user.id,
+              text: trimmedContent.substring(0, 100),
+              time_sent: message.time_sent
+            }
+          }
+        }
+      );
+
+      pubsub.publish(MESSAGE_SENT, {
+        messageReceived: message,
+        conversationId: conversation._id.toString()
+      });
+
+      return message;
+    },
+
+    async editMessage(_, { messageId, newContent }, context) {
+      const user = requireAuth(context);
+
+      let message;
+      try {
+        message = await Message.findOne({
+          _id: messageId,
+          sender_id: user.id
+        });
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!message) {
+        throw new GraphQLError('Message not found or unauthorized', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      if (message.meta.is_unsent) {
+        throw new GraphQLError('Cannot edit unsent message', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      const trimmedContent = newContent.trim();
+
+      if (trimmedContent.length === 0) {
+        throw new GraphQLError('Message content cannot be empty', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (trimmedContent.length > 5000) {
+        throw new GraphQLError('Message content exceeds maximum length', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      await Message.updateOne(
+        { _id: message._id },
+        {
+          $set: {
+            content: trimmedContent,
+            'meta.last_edit_at': new Date()
+          }
+        }
+      );
+
+      await Conversation.updateOne(
+        {
+          _id: message.conversation_id,
+          'last_message.sender_id': message.sender_id,
+          'last_message.time_sent': message.time_sent
+        },
+        {
+          $set: {
+            'last_message.text': trimmedContent.substring(0, 100)
+          }
+        }
+      );
+
+      const updatedMessage = await Message.findById(message._id).lean();
+
+      pubsub.publish(MESSAGE_UPDATED, {
+        messageUpdated: updatedMessage,
+        conversationId: message.conversation_id.toString()
+      });
+
+      return updatedMessage;
+    },
+
+    async unsendMessage(_, { messageId }, context) {
+      const user = requireAuth(context);
+
+      let message;
+      try {
+        message = await Message.findOne({
+          _id: messageId,
+          sender_id: user.id
+        });
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!message) {
+        throw new GraphQLError('Message not found or unauthorized', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      await Message.updateOne(
+        { _id: message._id },
+        {
+          $set: { 'meta.is_unsent': true }
+        }
+      );
+
+      const prevMessage = await Message.findOne({
+        conversation_id: message.conversation_id,
+        'meta.is_unsent': false,
+        time_sent: { $lt: message.time_sent }
+      })
+        .sort({ time_sent: -1 })
+        .lean();
+
+      await Conversation.updateOne(
+        { _id: message.conversation_id },
+        {
+          $set: {
+            last_message: prevMessage
+              ? {
+                sender_id: prevMessage.sender_id,
+                text: prevMessage.content.substring(0, 100),
+                time_sent: prevMessage.time_sent
+              }
+              : null
+          }
+        }
+      );
+
+      const updatedMessage = await Message.findById(message._id).lean();
+
+      pubsub.publish(MESSAGE_UPDATED, {
+        messageUpdated: updatedMessage,
+        conversationId: message.conversation_id.toString()
+      });
+
+      return updatedMessage;
+    },
+
+    async addReaction(_, { messageId, reactionType }, context) {
+      const user = requireAuth(context);
+
+      if (!Number.isInteger(reactionType) || reactionType < 1 || reactionType > 6) {
+        throw new GraphQLError('Reaction type must be integer between 1-6', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      let message;
+      try {
+        message = await Message.findById(messageId);
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!message) {
+        throw new GraphQLError('Message not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      const conversation = await Conversation.findById(message.conversation_id);
+
+      if (!conversation || !conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      await Message.updateOne(
+        { _id: message._id },
+        [
+          {
+            $set: {
+              reactions: {
+                $concatArrays: [
+                  {
+                    $filter: {
+                      input: '$reactions',
+                      cond: { $ne: ['$this.user_id', user.id] }
+                    }
+                  },
+                  [{ user_id: user.id, type: reactionType }]
+                ]
+              }
+            }
+          }
+        ],
+        { updatePipeline: true }
+      );
+
+      const updatedMessage = await Message.findById(message._id).lean();
+
+      pubsub.publish(REACTION_UPDATED, {
+        reactionUpdated: {
+          messageId: message._id.toString(),
+          reactions: updatedMessage.reactions
+        },
+        conversationId: message.conversation_id.toString()
+      });
+
+      return updatedMessage;
+    },
+
+    async removeReaction(_, { messageId }, context) {
+      const user = requireAuth(context);
+
+      let message;
+      try {
+        message = await Message.findById(messageId);
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!message) {
+        throw new GraphQLError('Message not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      const conversation = await Conversation.findById(message.conversation_id);
+
+      if (!conversation || !conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      await Message.updateOne(
+        { _id: message._id },
+        {
+          $pull: { reactions: { user_id: user.id } }
+        }
+      );
+
+      const updatedMessage = await Message.findById(message._id).lean();
+
+      pubsub.publish(REACTION_UPDATED, {
+        reactionUpdated: {
+          messageId: message._id.toString(),
+          reactions: updatedMessage.reactions
+        },
+        conversationId: message.conversation_id.toString()
+      });
+
+      return updatedMessage;
+    },
+
+    async forwardMessage(_, { messageId, toConversationId }, context) {
+      const user = requireAuth(context);
+
+      let originalMessage;
+      try {
+        originalMessage = await Message.findById(messageId);
+      } catch (error) {
+        throw new GraphQLError('Invalid message ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!originalMessage) {
+        throw new GraphQLError('Original message not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (originalMessage.meta.is_unsent) {
+        throw new GraphQLError('Cannot forward unsent message', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      const sourceConversation = await Conversation.findById(originalMessage.conversation_id);
+
+      if (!sourceConversation || !sourceConversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in source conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      let targetConversation;
+      try {
+        targetConversation = await Conversation.findById(toConversationId);
+      } catch (error) {
+        throw new GraphQLError('Invalid target conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!targetConversation) {
+        throw new GraphQLError('Target conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!targetConversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in target conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      const recipientId = targetConversation.participant_ids.find(id => id !== user.id);
+
+      const forwardedMessage = new Message({
+        conversation_id: targetConversation._id,
+        sender_id: user.id,
+        recipient_id: recipientId,
+        content: originalMessage.content,
+        time_sent: new Date(),
+        meta: {
+          is_unsent: false,
+          is_forwarded: true,
+          reply_to: null,
+          last_edit_at: null
+        },
+        reactions: []
+      });
+
+      await forwardedMessage.save();
+
+      await Conversation.updateOne(
+        { _id: targetConversation._id },
+        {
+          $set: {
+            last_message: {
+              sender_id: user.id,
+              text: originalMessage.content.substring(0, 100),
+              time_sent: forwardedMessage.time_sent
+            }
+          }
+        }
+      );
+
+      pubsub.publish(MESSAGE_SENT, {
+        messageReceived: forwardedMessage,
+        conversationId: targetConversation._id.toString()
+      });
+
+      return forwardedMessage;
+    },
+
     async markAsRead(_, { conversationId }, context) {
       const user = requireAuth(context);
 
@@ -544,6 +1044,70 @@ const conversationResolvers = {
 
       resolve(payload) {
         return payload.messageReceived;
+      }
+    },
+
+    messageUpdated: {
+      subscribe: withFilter(
+        () => pubsub.asyncIterator([MESSAGE_UPDATED]),
+
+        async (payload, variables, context) => {
+          if (!context.user) {
+            return false;
+          }
+
+          if (payload.conversationId !== variables.conversationId) {
+            return false;
+          }
+
+          const conversation = await Conversation.findById(variables.conversationId);
+
+          if (!conversation) {
+            return false;
+          }
+
+          if (!conversation.participant_ids.includes(context.user.id)) {
+            return false;
+          }
+
+          return true;
+        }
+      ),
+
+      resolve(payload) {
+        return payload.messageUpdated;
+      }
+    },
+
+    reactionUpdated: {
+      subscribe: withFilter(
+        () => pubsub.asyncIterator([REACTION_UPDATED]),
+
+        async (payload, variables, context) => {
+          if (!context.user) {
+            return false;
+          }
+
+          if (payload.conversationId !== variables.conversationId) {
+            return false;
+          }
+
+          const conversation = await Conversation.findById(variables.conversationId);
+
+          if (!conversation) {
+            return false;
+          }
+
+          if (!conversation.participant_ids.includes(context.user.id)) {
+            return false;
+          }
+
+          return true;
+        }
+      ),
+
+      resolve(payload) {
+        return payload.reactionUpdated;
       }
     },
 

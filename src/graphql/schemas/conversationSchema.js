@@ -27,6 +27,7 @@ type Message {
   timeSent: DateTime!
   meta: MessageMeta!
   reactions: [Reaction!]!
+  repliedMessage: Message
 }
 
 type MessageMeta {
@@ -39,6 +40,11 @@ type MessageMeta {
 type Reaction {
   userId: String!
   type: Int!
+}
+
+type ReactionUpdate {
+  messageId: ID!
+  reactions: [Reaction!]!
 }
 
 type MessageConnection {
@@ -115,6 +121,31 @@ extend type Mutation {
   markAsRead(conversationId: ID!): ReadReceipt!
   updateLastOnline: User!
   setTyping(conversationId: ID!, isTyping: Boolean!): Boolean!
+
+  replyToMessage(
+    conversationId: ID!  
+    replyToMessageId: ID!  
+    content: String!
+  ): Message!
+
+  editMessage(
+    messageId: ID!  
+    newContent: String!
+  ): Message!
+
+  unsendMessage(messageId: ID!): Message!
+
+  addReaction(
+    messageId: ID!  
+    reactionType: Int!
+  ): Message!
+
+  removeReaction(messageId: ID!): Message!
+
+  forwardMessage(
+    messageId: ID!  
+    toConversationId: ID!
+  ): Message!
 }  
 
 extend type Subscription {
@@ -124,11 +155,15 @@ extend type Subscription {
 
   readStatusChanged(conversationId: ID!): ReadReceipt!
   typingIndicator(conversationId: ID!): TypingStatus!
+
+  messageUpdated(conversationId: ID!): Message!
+  reactionUpdated(conversationId: ID!): ReactionUpdate!
 }
 
 type User {
   id: ID!
   lastOnline: DateTime!
-}`;
+}
+`;
 
 module.exports = { conversationTypeDefs };
