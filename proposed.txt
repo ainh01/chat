@@ -159,6 +159,8 @@ module.exports = {
   connectMongoDB,
   closeMongoConnection
 };
+
+@endhere
 DELIVERABLE 2: Mongoose Schemas
 src/models/Conversation.js:
 const mongoose = require('mongoose');

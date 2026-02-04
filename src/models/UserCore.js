@@ -29,10 +29,8 @@ async function generateUserId() {
       }
 
       attempts++;
-      console.warn(`⚠️ ID collision detected (attempt ${attempts}), regenerating...`);
 
     } catch (error) {
-      console.error('❌ Error generating user ID:', error.message);
       throw new Error('Failed to generate unique user ID');
     }
   }
@@ -56,7 +54,7 @@ async function createUser(username, password) {
     const passwordHash = await bcrypt.hash(password, SALT_ROUNDS);
 
     await query(
-      `INSERT INTO users (id, username, password_hash)
+      `INSERT INTO users (id, username, password_hash)  
        VALUES (@userId, @username, @passwordHash)`,
       {
         userId,
@@ -64,8 +62,6 @@ async function createUser(username, password) {
         passwordHash
       }
     );
-
-    console.log(`✅ User created: ${sanitizedUsername} (ID: ${userId})`);
 
     return {
       id: userId,

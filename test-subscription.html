@@ -1,0 +1,41 @@
+<!DOCTYPE html>  
+<html>  
+<head>  
+  <title>GraphQL Test</title>  
+  <script src="https://unpkg.com/graphql-ws/umd/graphql-ws.js"></script>  
+</head>  
+<body>  
+  <script>  
+    const client = graphqlWs.createClient({  
+      url: 'ws://localhost:4000/graphql',  
+    });  
+
+    (async () => {  
+      const onNext = (data) => {  
+        console.log('📨 Received:', data);  
+      };  
+
+      const unsubscribe = client.subscribe(  
+        {  
+          query: `  
+            subscription {  
+              messageReceived(conversationId: "6982ac76d485c5338cc8d622") {  
+                content  
+                senderId  
+                timeSent  
+              }  
+            }  
+          `,  
+        },  
+        {  
+          next: onNext,  
+          error: (error) => console.error('❌ Error:', error),  
+          complete: () => console.log('✅ Complete'),  
+        },  
+      );  
+
+      console.log('🎧 Listening for messages...');  
+    })();  
+  </script>  
+</body>  
+</html>  

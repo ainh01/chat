@@ -34,11 +34,11 @@ async function buildContext({ req, res }) {
 
       if (!user) {
         req.session.destroy((err) => {
-          if (err) console.error('Error destroying orphaned session:', err);
+          if (err) console.error(err);
         });
       }
     } catch (error) {
-      console.error('Error loading user in context:', error);
+      console.error(error);
     }
   }
 

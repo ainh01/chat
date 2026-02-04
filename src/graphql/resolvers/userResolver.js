@@ -55,8 +55,6 @@ const resolvers = {
         }
         const user = await createUser(username, password);
 
-        console.log(`User registered: ${user.username}`);
-
         return {
           success: true,
           message: 'Registration successful! Please log in.',
@@ -64,7 +62,6 @@ const resolvers = {
         };
 
       } catch (error) {
-        console.error('Registration error:', error.message);
         return {
           success: false,
           message: error.message || 'Registration failed',
@@ -96,7 +93,6 @@ const resolvers = {
         const isValidPassword = await verifyPassword(password, user.password_hash);
 
         if (!isValidPassword) {
-          console.log(`Failed login attempt for user: ${username}`);
           return {
             success: false,
             message: 'Invalid credentials',
@@ -117,7 +113,6 @@ const resolvers = {
           });
         });
 
-        console.log(`✅ User logged in: ${user.username} (Session: ${req.sessionID})`);
         return {
           success: true,
           message: 'Login successful',
@@ -128,7 +123,6 @@ const resolvers = {
         };
 
       } catch (error) {
-        console.error('Login error:', error);
         return {
           success: false,
           message: 'Login failed. Please try again.',
@@ -151,7 +145,6 @@ const resolvers = {
         await new Promise((resolve, reject) => {
           req.session.destroy((err) => {
             if (err) {
-              console.error('Session destruction error:', err);
               reject(err);
             } else {
               resolve();
@@ -164,15 +157,12 @@ const resolvers = {
           sameSite: 'lax'
         });
 
-        console.log(`✅ User logged out (Session: ${sessionId})`);
-
         return {
           success: true,
           message: 'Logged out successfully'
         };
 
       } catch (error) {
-        console.error('Logout error:', error);
         return {
           success: true,
           message: 'Logout completed'
