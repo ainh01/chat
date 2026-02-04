@@ -1,0 +1,2261 @@
+DELIVERABLE 1: MongoDB Connection Module
+src/db/nosql/db.js:
+const mongoose = require('mongoose');
+
+let isConnected = false;
+let connectionAttempts = 0;
+const MAX_RETRY_ATTEMPTS = 5;
+const INITIAL_RETRY_DELAY = 1000; // 1 second
+
+/**
+ * MongoDB Connection Manager
+ * 
+ * Architecture Notes:
+ * - Uses Mongoose ODM for schema validation and middleware hooks
+ * - Connection string must include database name: mongodb://host:port/dbName
+ * - Implements exponential backoff: 1s, 2s, 4s, 8s, 16s
+ * - Monitors connection state via Mongoose events
+ * 
+ * Connection Pool Configuration:
+ * - maxPoolSize: 10 (sufficient for single server, increase for load balancing)
+ * - serverSelectionTimeoutMS: 5000 (fail fast if MongoDB unreachable)
+ * - socketTimeoutMS: 45000 (close idle sockets to prevent resource leaks)
+ * 
+ * @async
+ * @throws {Error} If connection fails after MAX_RETRY_ATTEMPTS
+ */
+async function connectMongoDB() {
+  // Prevent duplicate connections (idempotent)
+  if (isConnected && mongoose.connection.readyState === 1) {
+    console.log('📦 MongoDB already connected (reusing existing connection)');
+    return mongoose.connection;
+  }
+
+  const MONGODB_URI = process.env.MONGODB_URI;
+
+  if (!MONGODB_URI) {
+    throw new Error(
+      '❌ MONGODB_URI not defined in environment variables.\n' +
+      '   Add to .env: MONGODB_URI=mongodb://localhost:27017/todoDB'
+    );
+  }
+
+  // Validate URI format (basic check)
+  if (!MONGODB_URI.includes('mongodb://') && !MONGODB_URI.includes('mongodb+srv://')) {
+    throw new Error(
+      '❌ Invalid MONGODB_URI format.\n' +
+      '   Expected: mongodb://host:port/database or mongodb+srv://host/database'
+    );
+  }
+
+  const options = {
+    maxPoolSize: 10,              // Maximum concurrent connections
+    serverSelectionTimeoutMS: 5000, // Timeout for initial connection
+    socketTimeoutMS: 45000,         // Close sockets after 45s inactivity
+    family: 4,                      // Force IPv4 (prevents IPv6 resolution delays)
+    
+    // Disable deprecated URL parser warnings
+    useNewUrlParser: true,
+    useUnifiedTopology: true
+  };
+
+  /**
+   * Exponential Backoff Retry Logic
+   * Formula: delay = INITIAL_RETRY_DELAY * (2 ^ attempt)
+   * Sequence: 1s, 2s, 4s, 8s, 16s
+   */
+  const attemptConnection = async (attempt = 1) => {
+    try {
+      console.log(`🔄 Connecting to MongoDB (attempt ${attempt}/${MAX_RETRY_ATTEMPTS})...`);
+      
+      await mongoose.connect(MONGODB_URI, options);
+      
+      isConnected = true;
+      connectionAttempts = 0;
+      
+      console.log('✅ MongoDB connected successfully');
+      console.log(`   Database: ${mongoose.connection.name}`);
+      console.log(`   Host: ${mongoose.connection.host}:${mongoose.connection.port}`);
+      
+      return mongoose.connection;
+      
+    } catch (error) {
+      console.error(`❌ MongoDB connection attempt ${attempt} failed:`, error.message);
+      
+      if (attempt >= MAX_RETRY_ATTEMPTS) {
+        throw new Error(
+          `Failed to connect to MongoDB after ${MAX_RETRY_ATTEMPTS} attempts.\n` +
+          `Last error: ${error.message}\n` +
+          `URI: ${MONGODB_URI.replace(/\/\/([^:]+):([^@]+)@/, '//***:***@')}`  // Mask credentials
+        );
+      }
+      
+      // Calculate exponential backoff delay
+      const delay = INITIAL_RETRY_DELAY * Math.pow(2, attempt - 1);
+      console.log(`⏳ Retrying in ${delay}ms...`);
+      
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return attemptConnection(attempt + 1);
+    }
+  };
+
+  return attemptConnection();
+}
+
+/**
+ * Graceful Shutdown Handler
+ * 
+ * Closes all active MongoDB connections and cleans up:
+ * - Active cursors
+ * - Pending operations
+ * - Connection pool
+ * 
+ * CRITICAL: Must be called before process.exit() to prevent:
+ * - Connection leaks on MongoDB server
+ * - Uncommitted write operations
+ * - Orphaned change streams (if implemented in Phase 2)
+ */
+async function closeMongoConnection() {
+  if (!isConnected) {
+    console.log('📦 MongoDB not connected, skipping disconnect');
+    return;
+  }
+
+  try {
+    await mongoose.connection.close();
+    isConnected = false;
+    console.log('✅ MongoDB connection closed gracefully');
+  } catch (error) {
+    console.error('❌ Error closing MongoDB connection:', error);
+    throw error;
+  }
+}
+
+/**
+ * Connection Event Listeners
+ * Monitors connection health and logs state changes
+ */
+mongoose.connection.on('connected', () => {
+  console.log('🔗 Mongoose connected to MongoDB');
+});
+
+mongoose.connection.on('error', (err) => {
+  console.error('❌ Mongoose connection error:', err);
+  isConnected = false;
+});
+
+mongoose.connection.on('disconnected', () => {
+  console.log('🔌 Mongoose disconnected from MongoDB');
+  isConnected = false;
+});
+
+// Handle Node.js process termination
+process.on('SIGINT', async () => {
+  await closeMongoConnection();
+  process.exit(0);
+});
+
+module.exports = {
+  connectMongoDB,
+  closeMongoConnection
+};
+DELIVERABLE 2: Mongoose Schemas
+src/models/Conversation.js:
+const mongoose = require('mongoose');
+
+/**
+ * Conversation Schema
+ * 
+ * Represents a 1-on-1 chat between two users.
+ * 
+ * Schema Design Decisions:
+ * 
+ * 1. participant_ids: Array of String (not ObjectId)
+ *    - References SQL users.id (16-digit BigInt stored as String)
+ *    - MUST be sorted alphabetically for consistent lookup
+ *    - Example: ["1234567890123456", "9876543210987654"]
+ *    - Indexed for O(1) conversation lookup
+ * 
+ * 2. last_message: Embedded subdocument (denormalized)
+ *    - Duplicates latest message for performance (avoid N+1 queries)
+ *    - Contains preview text (max 100 chars) not full content
+ *    - Eventual consistency: Updated after message insert (may lag briefly)
+ * 
+ * 3. read_status: Map<String, Date>
+ *    - Key: userId, Value: timestamp of last read
+ *    - Example: { "1234567890123456": "2024-01-15T10:30:00Z" }
+ *    - Used in Phase 2 for "Seen at X" feature
+ *    - Not implemented in Phase 1 (field exists but empty)
+ * 
+ * 4. is_blocked: Boolean (reserved for Phase 4)
+ *    - Blocks message sending/receiving
+ *    - Not implemented in Phase 1
+ * 
+ * Indexes Required:
+ *    db.conversations.createIndex({ participant_ids: 1 })
+ */
+
+const lastMessageSchema = new mongoose.Schema({
+  sender_id: {
+    type: String,
+    required: true,
+    ref: 'User'  // Logical reference (not enforced FK)
+  },
+  text: {
+    type: String,
+    required: true,
+    maxlength: 100,  // Preview only, truncated from original
+    trim: true
+  },
+  time_sent: {
+    type: Date,
+    required: true,
+    default: Date.now
+  }
+}, { _id: false });  // Disable _id for subdocument (not a separate entity)
+
+const conversationSchema = new mongoose.Schema({
+  participant_ids: {
+    type: [String],
+    required: true,
+    validate: {
+      validator: function(arr) {
+        // Must have exactly 2 participants (1-on-1 chat only in Phase 1)
+        if (arr.length !== 2) return false;
+        
+        // Participants must be unique (cannot chat with self)
+        if (arr[0] === arr[1]) return false;
+        
+        // Must be sorted (consistency requirement for lookup)
+        if (arr[0] > arr[1]) return false;
+        
+        return true;
+      },
+      message: 'participant_ids must contain exactly 2 unique sorted user IDs'
+    },
+    index: true  // Create index for fast lookup
+  },
+  
+  last_message: {
+    type: lastMessageSchema,
+    default: null  // Null until first message sent
+  },
+  
+  read_status: {
+    type: Map,
+    of: Date,
+    default: () => new Map()  // Initialize as empty map
+  },
+  
+  created_at: {
+    type: Date,
+    default: Date.now,
+    immutable: true  // Cannot be changed after creation
+  },
+  
+  is_blocked: {
+    type: Boolean,
+    default: false
+  }
+}, {
+  timestamps: false,  // Using custom created_at field
+  collection: 'conversations'
+});
+
+/**
+ * Pre-save Hook: Ensure participant_ids are sorted
+ * Defensive programming: Sort even if validation passed
+ * Prevents bugs from direct database inserts bypassing validation
+ */
+conversationSchema.pre('save', function(next) {
+  if (this.isModified('participant_ids')) {
+    this.participant_ids.sort();
+  }
+  next();
+});
+
+/**
+ * Static Method: Find conversation between two users
+ * Handles sorting internally so callers don't need to worry about order
+ * 
+ * @param {String} userId1 - First participant's SQL user ID
+ * @param {String} userId2 - Second participant's SQL user ID
+ * @returns {Promise<Conversation|null>}
+ */
+conversationSchema.statics.findByParticipants = async function(userId1, userId2) {
+  const sortedIds = [userId1, userId2].sort();
+  return this.findOne({ participant_ids: sortedIds });
+};
+
+/**
+ * Virtual Field: Get the other participant's ID
+ * Usage: conversation.getOtherParticipant(currentUserId)
+ * 
+ * @param {String} currentUserId - ID of current user
+ * @returns {String} - ID of the other participant
+ */
+conversationSchema.methods.getOtherParticipant = function(currentUserId) {
+  return this.participant_ids.find(id => id !== currentUserId);
+};
+
+const Conversation = mongoose.model('Conversation', conversationSchema);
+
+module.exports = Conversation;
+src/models/Message.js:
+const mongoose = require('mongoose');
+
+/**
+ * Message Schema
+ * 
+ * Represents a single message in a conversation.
+ * 
+ * Schema Design Decisions:
+ * 
+ * 1. conversation_id: ObjectId reference to Conversation
+ *    - Foreign key relationship (enforced by application, not MongoDB)
+ *    - Indexed with time_sent for efficient pagination queries
+ * 
+ * 2. sender_id / recipient_id: String (SQL user IDs)
+ *    - Redundant with conversation.participant_ids but required for:
+ *      a) Determining message direction (sent vs received)
+ *      b) Fast filtering in multi-conversation queries (Phase 2)
+ *      c) Authorization checks without loading conversation
+ * 
+ * 3. content: String (max 5000 chars)
+ *    - Plain text in Phase 1
+ *    - Phase 3 may add rich text markup (Markdown/HTML)
+ *    - NOT encrypted (add E2E encryption in Phase 5)
+ * 
+ * 4. meta: Embedded subdocument for extensibility
+ *    - is_unsent: Soft delete (content hidden but message preserved)
+ *    - is_forwarded: Display "🔄 Forwarded" badge
+ *    - reply_to: Reference to original message (threading)
+ *    - last_edit_at: Track edit history (single edit in Phase 1, full history in Phase 4)
+ * 
+ * 5. reactions: Array of { user_id, type }
+ *    - type: Integer 1-6 mapping to emojis (👍 ❤️ 😂 😮 😢 😡)
+ *    - User can have max 1 reaction per message (enforced in resolver)
+ *    - Embedded array (not separate collection) for atomic updates
+ * 
+ * Indexes Required:
+ *    db.messages.createIndex({ conversation_id: 1, time_sent: -1 })
+ *    db.messages.createIndex({ _id: 1, sender_id: 1 })
+ */
+
+const messageMetaSchema = new mongoose.Schema({
+  is_unsent: {
+    type: Boolean,
+    default: false
+  },
+  is_forwarded: {
+    type: Boolean,
+    default: false
+  },
+  reply_to: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Message',
+    default: null
+  },
+  last_edit_at: {
+    type: Date,
+    default: null
+  }
+}, { _id: false });
+
+const reactionSchema = new mongoose.Schema({
+  user_id: {
+    type: String,
+    required: true
+  },
+  type: {
+    type: Number,
+    required: true,
+    min: 1,
+    max: 6,
+    validate: {
+      validator: Number.isInteger,
+      message: 'Reaction type must be integer between 1-6'
+    }
+  }
+}, { _id: false });
+
+const messageSchema = new mongoose.Schema({
+  conversation_id: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'Conversation',
+    required: true,
+    index: true
+  },
+  
+  sender_id: {
+    type: String,
+    required: true,
+    ref: 'User'  // Logical reference to SQL users.id
+  },
+  
+  recipient_id: {
+    type: String,
+    required: true,
+    ref: 'User'
+  },
+  
+  content: {
+    type: String,
+    required: true,
+    maxlength: 5000,
+    trim: true,
+    validate: {
+      validator: function(v) {
+        // Content must be non-empty after trimming (unless unsent)
+        return this.meta?.is_unsent || v.length > 0;
+      },
+      message: 'Message content cannot be empty'
+    }
+  },
+  
+  time_sent: {
+    type: Date,
+    default: Date.now,
+    required: true,
+    immutable: true,  // Cannot change timestamp after creation
+    index: true
+  },
+  
+  meta: {
+    type: messageMetaSchema,
+    default: () => ({})
+  },
+  
+  reactions: {
+    type: [reactionSchema],
+    default: []
+  }
+}, {
+  timestamps: false,  // Using custom time_sent field
+  collection: 'messages'
+});
+
+/**
+ * Compound Index for Pagination Queries
+ * CRITICAL: Must be created manually in MongoDB shell or migration script
+ * 
+ * db.messages.createIndex({ conversation_id: 1, time_sent: -1 })
+ * 
+ * Query Pattern:
+ *   db.messages.find({ 
+ *     conversation_id: ObjectId("..."), 
+ *     time_sent: { $lt: cursorDate } 
+ *   }).sort({ time_sent: -1 }).limit(20)
+ * 
+ * Index Usage:
+ *   1. Seek to conversation_id (equality match)
+ *   2. Scan backwards from cursor (range + sort)
+ *   3. Stop after 20 documents (limit)
+ * 
+ * Without index: Full collection scan (O(n) where n = total messages)
+ * With index: Seek + scan (O(log n + k) where k = limit)
+ */
+messageSchema.index({ conversation_id: 1, time_sent: -1 });
+
+/**
+ * Index for Authorization Checks
+ * Used in editMessage/unsendMessage mutations to verify ownership
+ * 
+ * db.messages.createIndex({ _id: 1, sender_id: 1 })
+ */
+messageSchema.index({ _id: 1, sender_id: 1 });
+
+/**
+ * Virtual Field: Check if message is visible
+ * Used in resolvers to hide content of unsent messages
+ */
+messageSchema.virtual('isVisible').get(function() {
+  return !this.meta.is_unsent;
+});
+
+/**
+ * Instance Method: Get display content
+ * Returns placeholder for unsent messages
+ * 
+ * @returns {String} - Content to display in UI
+ */
+messageSchema.methods.getDisplayContent = function() {
+  if (this.meta.is_unsent) {
+    return null;  // Frontend displays "[Message unsent]"
+  }
+  return this.content;
+};
+
+/**
+ * Static Method: Fetch paginated messages with cursor
+ * Encapsulates pagination logic for reuse across resolvers
+ * 
+ * @param {ObjectId} conversationId - Conversation to fetch messages from
+ * @param {Date} cursorDate - Fetch messages before this timestamp
+ * @param {Number} limit - Max messages to return (default 20, max 100)
+ * @returns {Promise<Array<Message>>}
+ */
+messageSchema.statics.fetchPaginated = async function(conversationId, cursorDate = new Date(), limit = 20) {
+  // Cap limit to prevent abuse
+  const safeLimit = Math.min(Math.max(limit, 1), 100);
+  
+  return this.find({
+    conversation_id: conversationId,
+    time_sent: { $lt: cursorDate }
+  })
+  .sort({ time_sent: -1 })
+  .limit(safeLimit + 1);  // Fetch one extra to check hasNextPage
+};
+
+const Message = mongoose.model('Message', messageSchema);
+
+module.exports = Message;
+src/db/nosql/indexes.js:
+/**
+ * MongoDB Index Creation Script
+ * 
+ * WHEN TO RUN:
+ * - After first successful MongoDB connection
+ * - Before running any queries (migrations)
+ * - Can be run multiple times (createIndex is idempotent)
+ * 
+ * HOW TO RUN:
+ * Option 1: Call from startServer() in app.js
+ * Option 2: Run standalone: node src/db/nosql/indexes.js
+ * Option 3: MongoDB shell: mongo < indexes.mongo.js
+ * 
+ * PRODUCTION NOTES:
+ * - Index creation locks collection (blocks writes)
+ * - For large collections (>1M docs), build indexes in background
+ * - Monitor index build progress: db.currentOp()
+ */
+
+const Conversation = require('../models/Conversation');
+const Message = require('../models/Message');
+
+async function createIndexes() {
+  try {
+    console.log('📊 Creating MongoDB indexes...\n');
+
+    // ============================================
+    // Conversation Indexes
+    // ============================================
+
+    console.log('Creating conversations.participant_ids index...');
+    await Conversation.collection.createIndex(
+      { participant_ids: 1 },
+      {
+        name: 'idx_participant_ids',
+        unique: true,  // Prevent duplicate conversations between same users
+        background: false  // Foreground build (locks collection but faster)
+      }
+    );
+    console.log('✅ conversations.participant_ids indexed\n');
+
+    // ============================================
+    // Message Indexes
+    // ============================================
+
+    /**
+     * Index 1: Pagination Query Optimization
+     * Usage: fetchMessages(conversationId, cursor, limit)
+     * 
+     * Query Pattern:
+     *   { conversation_id: ObjectId, time_sent: { $lt: Date } }
+     *   .sort({ time_sent: -1 })
+     * 
+     * Compound index allows:
+     * 1. Seek to conversation_id (equality)
+     * 2. Scan backward through time_sent (range + sort in one pass)
+     */
+    console.log('Creating messages.conversation_id + time_sent compound index...');
+    await Message.collection.createIndex(
+      { conversation_id: 1, time_sent: -1 },
+      {
+        name: 'idx_conversation_time',
+        background: false
+      }
+    );
+    console.log('✅ messages.conversation_id + time_sent indexed');
+    console.log('   Optimizes: Pagination queries (fetchMessages)\n');
+
+    /**
+     * Index 2: Ownership Verification
+     * Usage: editMessage/unsendMessage authorization checks
+     * 
+     * Query Pattern:
+     *   { _id: ObjectId, sender_id: String }
+     * 
+     * Without this index, MongoDB would:
+     * 1. Use _id index to find message (fast)
+     * 2. Check sender_id in document (requires document scan)
+     * 
+     * With this index:
+     * 1. Single index lookup confirms both _id AND sender_id
+     * 2. Returns null if sender_id doesn't match (O(1) authorization)
+     */
+    console.log('Creating messages._id + sender_id compound index...');
+    await Message.collection.createIndex(
+      { _id: 1, sender_id: 1 },
+      {
+        name: 'idx_message_ownership',
+        background: false
+      }
+    );
+    console.log('✅ messages._id + sender_id indexed');
+    console.log('   Optimizes: Edit/unsend authorization checks\n');
+
+    console.log('🎉 All indexes created successfully!\n');
+
+    // Display index statistics
+    console.log('📈 Index Statistics:');
+    const convIndexes = await Conversation.collection.indexes();
+    const msgIndexes = await Message.collection.indexes();
+
+    console.log(`   Conversations: ${convIndexes.length} indexes`);
+    convIndexes.forEach(idx => {
+      console.log(`      - ${idx.name}: ${JSON.stringify(idx.key)}`);
+    });
+
+    console.log(`   Messages: ${msgIndexes.length} indexes`);
+    msgIndexes.forEach(idx => {
+      console.log(`      - ${idx.name}: ${JSON.stringify(idx.key)}`);
+    });
+
+  } catch (error) {
+    console.error('❌ Index creation failed:', error);
+    throw error;
+  }
+}
+
+module.exports = { createIndexes };
+
+// Allow standalone execution
+if (require.main === module) {
+  const { connectMongoDB, closeMongoConnection } = require('./db');
+  
+  (async () => {
+    try {
+      await connectMongoDB();
+      await createIndexes();
+      await closeMongoConnection();
+      process.exit(0);
+    } catch (error) {
+      console.error('Fatal error:', error);
+      process.exit(1);
+    }
+  })();
+}
+DELIVERABLE 4: GraphQL Schema Extension
+src/graphql/schemas/conversationSchema.js:
+const { gql } = require('graphql-tag');
+
+/**
+ * GraphQL Schema for Chat Messaging (Phase 1)
+ * 
+ * Schema Design Patterns:
+ * 
+ * 1. Relay Cursor Pagination:
+ *    - MessageConnection wraps message list with pagination metadata
+ *    - Cursor is opaque string (base64 timestamp) not exposed as Date
+ *    - hasNextPage tells client whether to show "Load More" button
+ * 
+ * 2. Null Propagation:
+ *    - lastMessage is nullable (null before first message sent)
+ *    - repliedMessage is nullable (null if not a reply)
+ *    - endCursor is nullable (null if no results)
+ * 
+ * 3. ID vs String Types:
+ *    - ID for MongoDB ObjectId (conversation_id, message_id)
+ *    - String for SQL user IDs (participantIds, senderId)
+ *    - Reason: Different ID systems, explicit type prevents confusion
+ * 
+ * 4. Subscription Arguments:
+ *    - conversationId required (prevents subscribing to ALL conversations)
+ *    - Authorization checked in resolver (user must be participant)
+ */
+
+const conversationTypeDefs = gql`
+  # ============================================
+  # Custom Scalars
+  # ============================================
+  
+  """
+  ISO 8601 datetime string (e.g., "2024-01-15T10:30:00.000Z")
+  Represented as String in GraphQL, parsed as Date in resolvers
+  """
+  scalar DateTime
+  
+  """
+  JSON object for flexible data (read_status map)
+  Phase 1: Not heavily used, reserved for Phase 2
+  """
+  scalar JSON
+
+  # ============================================
+  # Core Types
+  # ============================================
+
+  """
+  Represents a 1-on-1 conversation between two users.
+  Created via createConversation mutation (idempotent).
+  """
+  type Conversation {
+    """MongoDB ObjectId as string"""
+    id: ID!
+    
+    """
+    Array of exactly 2 user IDs (references SQL users.id).
+    Always sorted alphabetically for consistent lookup.
+    """
+    participantIds: [String!]!
+    
+    """
+    Preview of most recent message (denormalized for performance).
+    Null if no messages sent yet.
+    """
+    lastMessage: LastMessagePreview
+    
+    """
+    Map of userId → timestamp for "Seen at X" feature.
+    Phase 1: Always empty object {}
+    Phase 2: Updated by markAsRead mutation
+    """
+    readStatus: JSON
+    
+    """Conversation creation timestamp (immutable)"""
+    createdAt: DateTime!
+  }
+
+  """
+  Denormalized message preview (embedded in Conversation).
+  Contains truncated content for conversation list display.
+  """
+  type LastMessagePreview {
+    """User ID who sent the message"""
+    senderId: String!
+    
+    """
+    Preview text (max 100 chars, truncated from original).
+    Frontend displays: "John: Hey there..." 
+    """
+    text: String!
+    
+    """When message was sent"""
+    timeSent: DateTime!
+  }
+
+  """
+  Represents a single message in a conversation.
+  Messages are immutable after creation (except meta.is_unsent flag).
+  """
+  type Message {
+    """MongoDB ObjectId as string"""
+    id: ID!
+    
+    """Conversation this message belongs to"""
+    conversationId: ID!
+    
+    """User ID who sent the message (SQL users.id)"""
+    senderId: String!
+    
+    """User ID who receives the message (SQL users.id)"""
+    recipientId: String!
+    
+    """
+    Message text content (max 5000 chars).
+    NULL if meta.isUnsent is true (frontend displays placeholder).
+    """
+    content: String
+    
+    """
+    Server timestamp when message was created.
+    Immutable (never use client-provided time due to clock skew).
+    """
+    timeSent: DateTime!
+    
+    """Extended metadata (unsent/forwarded/edited status)"""
+    meta: MessageMeta!
+    
+    """
+    Array of reactions (emoji responses).
+    Phase 1: Always empty array []
+    Phase 3: Populated by addReaction mutation
+    """
+    reactions: [Reaction!]!
+  }
+
+  """
+  Message metadata for extended features.
+  Embedded subdocument (not separate GraphQL type query).
+  """
+  type MessageMeta {
+    """
+    If true, message was deleted (unsendMessage mutation).
+    Resolver returns content=null, frontend shows "[Message unsent]".
+    """
+    isUnsent: Boolean!
+    
+    """
+    If true, message was forwarded from another conversation.
+    Frontend displays "🔄 Forwarded" badge.
+    """
+    isForwarded: Boolean!
+    
+    """
+    Reference to original message if this is a reply.
+    Phase 1: Always null
+    Phase 3: Set by replyToMessage mutation
+    """
+    replyTo: ID
+    
+    """
+    Timestamp of most recent edit.
+    Phase 1: Always null
+    Phase 3: Set by editMessage mutation
+    """
+    lastEditAt: DateTime
+  }
+
+  """
+  Emoji reaction to a message.
+  User can have max 1 reaction per message (enforced in resolver).
+  """
+  type Reaction {
+    """User ID who reacted"""
+    userId: String!
+    
+    """
+    Reaction type (integer 1-6):
+    1 = 👍 (thumbs up)
+    2 = ❤️ (heart)
+    3 = 😂 (laughing)
+    4 = 😮 (surprised)
+    5 = 😢 (sad)
+    6 = 😡 (angry)
+    """
+    type: Int!
+  }
+
+  # ============================================
+  # Pagination Types (Relay Cursor Spec)
+  # ============================================
+
+  """
+  Paginated list of messages with cursor metadata.
+  Implements Relay cursor pagination pattern.
+  """
+  type MessageConnection {
+    """Array of message edges (cursor + data pairs)"""
+    edges: [MessageEdge!]!
+    
+    """Pagination metadata for "Load More" button"""
+    pageInfo: PageInfo!
+  }
+
+  """
+  Edge in message pagination (wraps message with cursor).
+  Cursor is opaque string (base64-encoded timestamp).
+  """
+  type MessageEdge {
+    """
+    Pagination cursor (base64-encoded ISO 8601 timestamp).
+    Pass this to fetchMessages(cursor) for next page.
+    Example: "MjAyNC0wMS0xNVQxMDozMDowMC4wMDBa"
+    """
+    cursor: String!
+    
+    """The actual message data"""
+    node: Message!
+  }
+
+  """
+  Metadata about pagination state.
+  Tells client whether more results available.
+  """
+  type PageInfo {
+    """
+    True if more messages exist before earliest returned message.
+    If true, client should show "Load More" / "Load Older Messages" button.
+    """
+    hasNextPage: Boolean!
+    
+    """
+    Cursor of last message in current page.
+    Null if no messages returned.
+    Client can use this for fetchMessages(cursor: endCursor).
+    """
+    endCursor: String
+  }
+
+  # ============================================
+  # Queries
+  # ============================================
+
+  extend type Query {
+    """
+    Fetch paginated messages from a conversation.
+    Returns newest messages first (reverse chronological).
+    
+    Authorization: User must be participant in conversation (403 if not).
+    
+    Pagination Flow:
+    1. Initial load: fetchMessages(conversationId: "abc", limit: 20)
+       → Returns 20 newest messages
+    2. Load more: fetchMessages(conversationId: "abc", cursor: pageInfo.endCursor, limit: 20)
+       → Returns 20 messages older than cursor
+    3. Repeat until hasNextPage = false
+    
+    Example Query:
+    ```graphql
+    query GetMessages($convId: ID!, $cursor: String) {
+      fetchMessages(conversationId: $convId, cursor: $cursor, limit: 20) {
+        edges {
+          cursor
+          node {
+            id
+            content
+            senderId
+            timeSent
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+    ```
+    """
+    fetchMessages(
+      """Conversation ID to fetch messages from"""
+      conversationId: ID!
+      
+      """
+      Pagination cursor (base64 timestamp).
+      Omit for first page (fetches newest messages).
+      """
+      cursor: String
+      
+      """
+      Max messages to return (default 20, max 100).
+      Actual returned count may be less (end of conversation).
+      """
+      limit: Int = 20
+    ): MessageConnection!
+  }
+
+  # ============================================
+  # Mutations
+  # ============================================
+
+  extend type Mutation {
+    """
+    Create or retrieve a 1-on-1 conversation with another user.
+    Idempotent: Returns existing conversation if already created.
+    
+    Authorization: Both users must exist in SQL users table.
+    Validation: Cannot create conversation with self (400 error).
+    
+    Example:
+    ```graphql
+    mutation CreateConvo {
+      createConversation(participantId: "9876543210987654") {
+        id
+        participantIds
+        createdAt
+      }
+    }
+    ```
+    
+    Returns: Conversation object (new or existing)
+    """
+    createConversation(
+      """
+      User ID to start conversation with (SQL users.id).
+      Must be different from authenticated user's ID.
+      """
+      participantId: String!
+    ): Conversation!
+
+    """
+    Send a message in an existing conversation.
+    Triggers messageReceived subscription for both participants.
+    
+    Authorization: User must be participant in conversation (403 if not).
+    Validation:
+    - content must be non-empty after trim
+    - content max 5000 characters
+    
+    Side Effects:
+    1. Creates message document in MongoDB
+    2. Updates conversation.lastMessage (denormalized cache)
+    3. Publishes to MESSAGE_SENT PubSub topic
+    
+    Example:
+    ```graphql
+    mutation SendMsg($convId: ID!, $text: String!) {
+      sendMessage(conversationId: $convId, content: $text) {
+        id
+        content
+        timeSent
+        senderId
+      }
+    }
+    ```
+    
+    Returns: Created message object
+    """
+    sendMessage(
+      """Conversation to send message in"""
+      conversationId: ID!
+      
+      """
+      Message text (1-5000 chars after trim).
+      Plain text only in Phase 1 (no Markdown/HTML).
+      """
+      content: String!
+    ): Message!
+  }
+
+  # ============================================
+  # Subscriptions (WebSocket)
+  # ============================================
+
+  extend type Subscription {
+    """
+    Subscribe to new messages in a conversation.
+    Delivers messages sent by BOTH participants (including own messages for multi-device sync).
+    
+    Authorization: User must be participant in conversation (403 if not).
+    Transport: WebSocket (graphql-ws protocol)
+    
+    Usage Pattern:
+    1. Client opens WebSocket connection with session cookie
+    2. Client sends subscription operation with conversationId
+    3. Server verifies user is participant
+    4. Server delivers Message objects when sendMessage mutation called
+    
+    Example:
+    ```graphql
+    subscription OnNewMessage($convId: ID!) {
+      messageReceived(conversationId: $convId) {
+        id
+        senderId
+        content
+        timeSent
+      }
+    }
+    ```
+    
+    Client Side (Apollo Client):
+    ```javascript
+    const { data } = useSubscription(ON_MESSAGE, {
+      variables: { convId: conversation.id },
+      onData: ({ data }) => {
+        // Update local cache with new message
+        updateMessageList(data.messageReceived);
+      }
+    });
+    ```
+    
+    Returns: Message object (published by sendMessage mutation)
+    """
+    messageReceived(
+      """
+      Conversation ID to subscribe to.
+      User must be participant (verified on subscription initiation).
+      """
+      conversationId: ID!
+    ): Message!
+  }
+`;
+
+module.exports = { conversationTypeDefs };
+DELIVERABLE 5: GraphQL Resolvers
+src/graphql/resolvers/conversationResolver.js:
+const { GraphQLError } = require('graphql');
+const { requireAuth } = require('../../middleware/auth');
+const { findUserById } = require('../../models/UserCore');
+const Conversation = require('../../models/Conversation');
+const Message = require('../../models/Message');
+const { pubsub, MESSAGE_SENT } = require('../../pubsub/events');
+const { withFilter } = require('graphql-subscriptions');
+
+/**
+ * Conversation Resolvers (Phase 1: CHAT-001 to CHAT-004)
+ * 
+ * Architecture Notes:
+ * - All mutations require authentication (requireAuth checks context.user)
+ * - All operations verify user is conversation participant (authorization)
+ * - Errors use GraphQLError with extensions.code for client-side handling
+ * - PubSub events published for real-time WebSocket delivery
+ * 
+ * Error Codes:
+ * - UNAUTHENTICATED: No valid session (401)
+ * - FORBIDDEN: User not authorized for resource (403)
+ * - BAD_REQUEST: Invalid input data (400)
+ * - NOT_FOUND: Resource doesn't exist (404)
+ */
+
+const conversationResolvers = {
+  // ============================================
+  // Custom Scalar Resolvers
+  // ============================================
+
+  DateTime: {
+    /**
+     * Serialize Date object to ISO 8601 string for client
+     * Example: new Date() → "2024-01-15T10:30:00.000Z"
+     */
+    serialize(value) {
+      if (value instanceof Date) {
+        return value.toISOString();
+      }
+      return null;
+    },
+
+    /**
+     * Parse ISO 8601 string from client to Date object
+     * Example: "2024-01-15T10:30:00.000Z" → new Date()
+     */
+    parseValue(value) {
+      if (typeof value === 'string') {
+        const date = new Date(value);
+        if (!isNaN(date.getTime())) {
+          return date;
+        }
+      }
+      throw new GraphQLError('Invalid DateTime format (expected ISO 8601)', {
+        extensions: { code: 'BAD_REQUEST' }
+      });
+    },
+
+    /**
+     * Parse literal DateTime from GraphQL query
+     */
+    parseLiteral(ast) {
+      if (ast.kind === 'StringValue') {
+        return new Date(ast.value);
+      }
+      return null;
+    }
+  },
+
+  JSON: {
+    /**
+     * Pass-through for JSON objects (read_status map)
+     */
+    serialize(value) {
+      return value;
+    },
+    parseValue(value) {
+      return value;
+    },
+    parseLiteral(ast) {
+      return ast.value;
+    }
+  },
+
+  // ============================================
+  // Type Resolvers (Field-level)
+  // ============================================
+
+  Message: {
+    /**
+     * Hide content of unsent messages
+     * Returns null if message was unsent (meta.is_unsent = true)
+     * Frontend displays "[Message unsent]" placeholder
+     */
+    content(parent) {
+      if (parent.meta?.is_unsent) {
+        return null;
+      }
+      return parent.content;
+    },
+
+    /**
+     * Convert MongoDB ObjectId to string for GraphQL ID type
+     */
+    id(parent) {
+      return parent._id.toString();
+    },
+
+    conversationId(parent) {
+      return parent.conversation_id.toString();
+    },
+
+    senderId(parent) {
+      return parent.sender_id;
+    },
+
+    recipientId(parent) {
+      return parent.recipient_id;
+    },
+
+    timeSent(parent) {
+      return parent.time_sent;
+    }
+  },
+
+  Conversation: {
+    id(parent) {
+      return parent._id.toString();
+    },
+
+    participantIds(parent) {
+      return parent.participant_ids;
+    },
+
+    lastMessage(parent) {
+      if (!parent.last_message) return null;
+      
+      return {
+        senderId: parent.last_message.sender_id,
+        text: parent.last_message.text,
+        timeSent: parent.last_message.time_sent
+      };
+    },
+
+    readStatus(parent) {
+      // Convert Mongoose Map to plain object
+      return parent.read_status ? Object.fromEntries(parent.read_status) : {};
+    },
+
+    createdAt(parent) {
+      return parent.created_at;
+    }
+  },
+
+  // ============================================
+  // Query Resolvers
+  // ============================================
+
+  Query: {
+    /**
+     * [CHAT-003] Fetch Messages with Cursor-Based Pagination
+     * 
+     * Flow:
+     * 1. Authenticate user
+     * 2. Verify conversation exists and user is participant
+     * 3. Decode cursor (base64 timestamp) or use current time
+     * 4. Query messages before cursor, sorted newest first
+     * 5. Build edges with cursors
+     * 6. Return MessageConnection with pagination metadata
+     * 
+     * @param {Object} _ - Parent (unused)
+     * @param {Object} args - { conversationId, cursor?, limit? }
+     * @param {Object} context - { user, req, res }
+     * @returns {Promise<MessageConnection>}
+     */
+    async fetchMessages(_, { conversationId, cursor, limit = 20 }, context) {
+      // Step 1: Authentication
+      const user = requireAuth(context);
+
+      // Step 2: Validate and authorize
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId);
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      // Authorization: Verify user is participant
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      // Step 3: Decode cursor
+      let cursorDate = new Date();
+      if (cursor) {
+        try {
+          const decodedCursor = Buffer.from(cursor, 'base64').toString('utf-8');
+          cursorDate = new Date(decodedCursor);
+
+          if (isNaN(cursorDate.getTime())) {
+            throw new Error('Invalid date');
+          }
+        } catch (error) {
+          throw new GraphQLError('Invalid cursor format', {
+            extensions: { code: 'BAD_REQUEST' }
+          });
+        }
+      }
+
+      // Step 4: Validate limit
+      const safeLimit = Math.min(Math.max(limit, 1), 100);
+
+      // Step 5: Fetch messages (limit + 1 to check hasNextPage)
+      const messages = await Message.find({
+        conversation_id: conversation._id,
+        time_sent: { $lt: cursorDate }
+      })
+      .sort({ time_sent: -1 })
+      .limit(safeLimit + 1)
+      .lean();  // Return plain objects (faster)
+
+      // Step 6: Build pagination response
+      const hasNextPage = messages.length > safeLimit;
+      const messageNodes = messages.slice(0, safeLimit);
+
+      const edges = messageNodes.map(msg => ({
+        cursor: Buffer.from(msg.time_sent.toISOString()).toString('base64'),
+        node: msg
+      }));
+
+      const endCursor = edges.length > 0 ? edges[edges.length - 1].cursor : null;
+
+      return {
+        edges,
+        pageInfo: {
+          hasNextPage,
+          endCursor
+        }
+      };
+    }
+  },
+
+  // ============================================
+  // Mutation Resolvers
+  // ============================================
+
+  Mutation: {
+    /**
+     * [CHAT-001] Create Conversation
+     * 
+     * Creates a new 1-on-1 conversation or returns existing one (idempotent).
+     * 
+     * Flow:
+     * 1. Authenticate user
+     * 2. Validate participantId exists in SQL users table
+     * 3. Check participantId ≠ userId (cannot chat with self)
+     * 4. Query MongoDB for existing conversation
+     * 5. If not exists, create new conversation with sorted participant_ids
+     * 6. Return conversation
+     * 
+     * @param {Object} _ - Parent (unused)
+     * @param {Object} args - { participantId }
+     * @param {Object} context - { user }
+     * @returns {Promise<Conversation>}
+     */
+    async createConversation(_, { participantId }, context) {
+      // Step 1: Authentication
+      const user = requireAuth(context);
+
+      // Step 2: Validate participantId
+      if (!participantId || typeof participantId !== 'string') {
+        throw new GraphQLError('Invalid participant ID', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      // Step 3: Check not self-conversation
+      if (participantId === user.id) {
+        throw new GraphQLError('Cannot create conversation with yourself', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      // Step 4: Verify participant exists in SQL users table
+      const participantUser = await findUserById(participantId);
+      if (!participantUser) {
+        throw new GraphQLError('Participant user not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      // Step 5: Check for existing conversation (sorted participant_ids)
+      const sortedIds = [user.id, participantId].sort();
+      let conversation = await Conversation.findOne({
+        participant_ids: sortedIds
+      });
+
+      // Step 6: Create if doesn't exist
+      if (!conversation) {
+        conversation = new Conversation({
+          participant_ids: sortedIds,
+          last_message: null,
+          read_status: new Map(),
+          created_at: new Date(),
+          is_blocked: false
+        });
+
+        await conversation.save();
+
+        console.log(`✅ Created conversation: ${conversation._id} (${sortedIds.join(' ↔ ')})`);
+      } else {
+        console.log(`♻️  Returning existing conversation: ${conversation._id}`);
+      }
+
+      return conversation;
+    },
+
+    /**
+     * [CHAT-002] Send Message
+     * 
+     * Sends a message in an existing conversation and broadcasts via WebSocket.
+     * 
+     * Flow:
+     * 1. Authenticate user
+     * 2. Verify conversation exists and user is participant
+     * 3. Validate content (non-empty, max 5000 chars)
+     * 4. Determine recipientId (the other participant)
+     * 5. Insert message document
+     * 6. Update conversation.last_message (denormalized cache)
+     * 7. Publish to PubSub for WebSocket subscribers
+     * 8. Return message
+     * 
+     * @param {Object} _ - Parent (unused)
+     * @param {Object} args - { conversationId, content }
+     * @param {Object} context - { user }
+     * @returns {Promise<Message>}
+     */
+    async sendMessage(_, { conversationId, content }, context) {
+      // Step 1: Authentication
+      const user = requireAuth(context);
+
+      // Step 2: Validate and authorize conversation
+      let conversation;
+      try {
+        conversation = await Conversation.findById(conversationId);
+      } catch (error) {
+        throw new GraphQLError('Invalid conversation ID format', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (!conversation) {
+        throw new GraphQLError('Conversation not found', {
+          extensions: { code: 'NOT_FOUND' }
+        });
+      }
+
+      if (!conversation.participant_ids.includes(user.id)) {
+        throw new GraphQLError('You are not a participant in this conversation', {
+          extensions: { code: 'FORBIDDEN' }
+        });
+      }
+
+      // Step 3: Validate content
+      const trimmedContent = content.trim();
+
+      if (trimmedContent.length === 0) {
+        throw new GraphQLError('Message content cannot be empty', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      if (trimmedContent.length > 5000) {
+        throw new GraphQLError('Message content exceeds maximum length (5000 characters)', {
+          extensions: { code: 'BAD_REQUEST' }
+        });
+      }
+
+      // Step 4: Determine recipient (the other participant)
+      const recipientId = conversation.participant_ids.find(id => id !== user.id);
+
+      if (!recipientId) {
+        throw new GraphQLError('Conversation must have exactly 2 participants', {
+          extensions: { code: 'INTERNAL_SERVER_ERROR' }
+        });
+      }
+
+      // Step 5: Create message document
+      const message = new Message({
+        conversation_id: conversation._id,
+        sender_id: user.id,
+        recipient_id: recipientId,
+        content: trimmedContent,
+        time_sent: new Date(),
+        meta: {
+          is_unsent: false,
+          is_forwarded: false,
+          reply_to: null,
+          last_edit_at: null
+        },
+        reactions: []
+      });
+
+      await message.save();
+
+      // Step 6: Update conversation's last_message (denormalization)
+      // Use updateOne instead of save to avoid race conditions
+      await Conversation.updateOne(
+        { _id: conversation._id },
+        {
+          $set: {
+            last_message: {
+              sender_id: user.id,
+              text: trimmedContent.substring(0, 100),  // Preview only
+              time_sent: message.time_sent
+            }
+          }
+        }
+      );
+
+      // Step 7: Publish to WebSocket subscribers
+      pubsub.publish(MESSAGE_SENT, {
+        messageReceived: message,  // Subscription field name
+        conversationId: conversation._id.toString()  // For filtering
+      });
+
+      console.log(`📨 Message sent: ${message._id} (${user.id} → ${recipientId})`);
+
+      return message;
+    }
+  },
+
+  // ============================================
+  // Subscription Resolvers
+  // ============================================
+
+  Subscription: {
+    /**
+     * [CHAT-004] Subscribe to New Messages
+     * 
+     * Real-time WebSocket subscription for new messages in a conversation.
+     * 
+     * Flow:
+     * 1. Client opens WebSocket with session cookie
+     * 2. Client sends subscription with conversationId
+     * 3. Server verifies user is participant (authorization)
+     * 4. Server subscribes to MESSAGE_SENT PubSub topic
+     * 5. When sendMessage mutation called, pubsub.publish() triggers
+     * 6. withFilter checks conversationId matches and user is participant
+     * 7. Message delivered to client
+     * 
+     * Security:
+     * - Authorization checked on EVERY published message (not just subscription start)
+     * - Prevents race condition where user joins conversation mid-subscription
+     * 
+     * @returns {AsyncIterator<Message>}
+     */
+    messageReceived: {
+      /**
+       * Subscribe function: Creates async iterator for PubSub topic
+       */
+      subscribe: withFilter(
+        // Step 1: Create iterator for MESSAGE_SENT topic
+        (_, __, { pubsub }) => pubsub.asyncIterator([MESSAGE_SENT]),
+
+        // Step 2: Filter function (called for each published message)
+        async (payload, variables, context) => {
+          // Authorization: Verify user is participant
+          // This runs on EVERY message publish (not just subscription initiation)
+          
+          if (!context.user) {
+            console.warn('⚠️  Unauthenticated subscription attempt blocked');
+            return false;
+          }
+
+          // Check if message is for the requested conversation
+          if (payload.conversationId !== variables.conversationId) {
+            return false;
+          }
+
+          // Verify user is participant in this conversation
+          // Note: This query runs on every message, but it's fast (indexed lookup)
+          const conversation = await Conversation.findById(variables.conversationId);
+
+          if (!conversation) {
+            console.warn(`⚠️  Subscription to non-existent conversation: ${variables.conversationId}`);
+            return false;
+          }
+
+          if (!conversation.participant_ids.includes(context.user.id)) {
+            console.warn(`⚠️  Unauthorized subscription attempt by ${context.user.id} to conversation ${variables.conversationId}`);
+            return false;
+          }
+
+          // Message passes all filters, deliver to client
+          return true;
+        }
+      ),
+
+      /**
+       * Resolve function: Transform payload to expected return type
+       * Extracts messageReceived field from payload
+       */
+      resolve(payload) {
+        return payload.messageReceived;
+      }
+    }
+  }
+};
+
+module.exports = { conversationResolvers };
+DELIVERABLE 6: PubSub Infrastructure
+src/pubsub/events.js:
+/**
+ * PubSub Event System for GraphQL Subscriptions
+ * 
+ * Phase 1 Implementation:
+ * - Uses in-memory PubSub (graphql-subscriptions library)
+ * - Suitable for single-server development and testing
+ * 
+ * Production Migration Path (Phase 2+):
+ * - Replace with RedisPubSub for multi-server horizontal scaling
+ * - Redis acts as message broker between Apollo Server instances
+ * - Required when running multiple server replicas behind load balancer
+ * 
+ * Architecture Notes:
+ * - PubSub is singleton (one instance shared across resolvers)
+ * - Topic names use constants to prevent typos
+ * - Payload structure must match subscription resolver expectations
+ * 
+ * Event Flow Example (MESSAGE_SENT):
+ * 1. User A calls sendMessage mutation
+ * 2. Resolver publishes: pubsub.publish(MESSAGE_SENT, { messageReceived: msg, conversationId })
+ * 3. PubSub broadcasts to all asyncIterator subscribers
+ * 4. withFilter checks if User B is participant
+ * 5. If authorized, Message delivered to User B's WebSocket
+ * 
+ * Performance Characteristics:
+ * - In-memory PubSub: ~1ms publish latency, ~10k events/sec per topic
+ * - Redis PubSub: ~5ms publish latency (network overhead), unlimited throughput
+ * 
+ * Migration Example (Production):
+ * ```javascript
+ * const { RedisPubSub } = require('graphql-redis-subscriptions');
+ * const Redis = require('ioredis');
+ * 
+ * const pubsub = new RedisPubSub({
+ *   publisher: new Redis(process.env.REDIS_URL),
+ *   subscriber: new Redis(process.env.REDIS_URL)
+ * });
+ * ```
+ */
+
+const { PubSub } = require('graphql-subscriptions');
+
+// ============================================
+// Singleton PubSub Instance
+// ============================================
+
+/**
+ * Initialize in-memory PubSub for Phase 1
+ * 
+ * CRITICAL: This instance must be imported in:
+ * 1. conversationResolver.js (for publishing events)
+ * 2. app.js context builder (for subscription resolvers)
+ * 
+ * Singleton Pattern Rationale:
+ * - Ensures all resolvers use same event bus
+ * - Prevents multiple PubSub instances (would not communicate)
+ */
+const pubsub = new PubSub();
+
+// ============================================
+// Event Topic Constants
+// ============================================
+
+/**
+ * Topic names for PubSub events
+ * 
+ * Naming Convention: <EVENT_NAME> (uppercase)
+ * Usage: pubsub.publish(MESSAGE_SENT, payload)
+ * 
+ * Phase 1 Topics:
+ */
+
+/**
+ * MESSAGE_SENT Event
+ * 
+ * Published by: sendMessage mutation (CHAT-002)
+ * Subscribed by: messageReceived subscription (CHAT-004)
+ * 
+ * Payload Structure:
+ * {
+ *   messageReceived: Message,    // Full message object (matches subscription return type)
+ *   conversationId: String       // For withFilter authorization check
+ * }
+ * 
+ * Authorization:
+ * - withFilter checks user is participant in conversationId
+ * - Payload must include conversationId even though not in subscription return type
+ * 
+ * Delivery Guarantee:
+ * - At-most-once (in-memory PubSub does not persist events)
+ * - If client disconnected during publish, message lost (acceptable in Phase 1)
+ * - Client re-fetches via fetchMessages on reconnect
+ */
+const MESSAGE_SENT = 'MESSAGE_SENT';
+
+/**
+ * Phase 2+ Topics (Not Implemented Yet)
+ * 
+ * Documented here for reference (do not use in Phase 1):
+ * 
+ * - MESSAGE_UPDATED: Edit/unsend events (Phase 3)
+ * - REACTION_UPDATED: Emoji reactions (Phase 3)
+ * - READ_STATUS_CHANGED: "Seen at X" updates (Phase 2)
+ * - TYPING: Typing indicators (Phase 2)
+ * - USER_STATUS_CHANGED: Online/offline presence (Phase 2)
+ */
+
+// ============================================
+// Exports
+// ============================================
+
+module.exports = {
+  pubsub,
+  MESSAGE_SENT
+};
+
+// ============================================
+// Health Check (Optional Debug Utility)
+// ============================================
+
+/**
+ * Monitor PubSub event traffic (development only)
+ * Logs all published events for debugging subscription issues
+ * 
+ * Enable by setting: DEBUG_PUBSUB=true in .env
+ */
+if (process.env.DEBUG_PUBSUB === 'true') {
+  const originalPublish = pubsub.publish.bind(pubsub);
+  
+  pubsub.publish = (triggerName, payload) => {
+    console.log(`[PubSub] Publishing to ${triggerName}:`, {
+      conversationId: payload.conversationId,
+      messageId: payload.messageReceived?.id,
+      timestamp: new Date().toISOString()
+    });
+    return originalPublish(triggerName, payload);
+  };
+  
+  console.log('🐛 PubSub debug mode enabled (all events logged)');
+}
+DELIVERABLE 7: WebSocket Integration
+app.js:
+const express = require('express');
+const http = require('http');  // NEW: For WebSocket server
+const session = require('express-session');
+const RedisStore = require('connect-redis').default;
+const { createClient } = require('redis');
+const { ApolloServer } = require('@apollo/server');
+const { expressMiddleware } = require('@apollo/server/express4');
+const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer');  // NEW
+const { ApolloServerPluginLandingPageGraphQLPlayground } = require('@apollo/server-plugin-landing-page-graphql-playground');
+const { makeExecutableSchema } = require('@graphql-tools/schema');  // NEW
+const { WebSocketServer } = require('ws');  // NEW
+const { useServer } = require('graphql-ws/lib/use/ws');  // NEW
+const cors = require('cors');
+const dotenv = require('dotenv');
+
+// Existing imports
+const { typeDefs: userTypeDefs } = require('./src/graphql/schemas/userSchema.js');
+const { resolvers: userResolvers } = require('./src/graphql/resolvers/userResolver.js');
+
+// NEW: Chat system imports
+const { conversationTypeDefs } = require('./src/graphql/schemas/conversationSchema.js');
+const { conversationResolvers } = require('./src/graphql/resolvers/conversationResolver.js');
+const { pubsub } = require('./src/pubsub/events.js');
+
+const { buildContext } = require('./src/middleware/auth.js');
+const { closePool } = require('./src/db/sql/db.js');
+
+// NEW: MongoDB imports
+const { connectMongoDB, closeMongoConnection } = require('./src/db/nosql/db.js');
+const { createIndexes } = require('./src/db/nosql/indexes.js');
+
+dotenv.config();
+
+const PORT = process.env.PORT || 4000;
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
+const SESSION_SECRET = process.env.SESSION_SECRET;
+const SESSION_MAX_AGE = parseInt(process.env.SESSION_MAX_AGE) || 604800000;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+if (!SESSION_SECRET) {
+  console.error('❌ FATAL: SESSION_SECRET not set in environment');
+  console.error('   Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+  process.exit(1);
+}
+
+const app = express();
+
+// ============================================
+// NEW: HTTP Server (Required for WebSocket)
+// ============================================
+
+/**
+ * Create HTTP server wrapping Express app
+ * 
+ * Architecture Change:
+ * - Before: app.listen() creates HTTP server internally
+ * - After: Explicitly create httpServer to attach WebSocket server
+ * 
+ * Why:
+ * - WebSocket upgrade requests come on same port as HTTP
+ * - Need access to underlying HTTP server for ws.WebSocketServer
+ */
+const httpServer = http.createServer(app);
+
+// ============================================
+// Redis Client (Existing)
+// ============================================
+
+const redisClient = createClient({
+  socket: {
+    host: REDIS_HOST,
+    port: REDIS_PORT,
+    reconnectStrategy: (retries) => {
+      if (retries > 10) {
+        console.error('❌ Redis reconnection failed after 10 attempts');
+        return new Error('Redis connection failed');
+      }
+      const delay = Math.min(retries * 100, 3000);
+      console.log(`⚠️  Redis reconnecting in ${delay}ms (attempt ${retries})`);
+      return delay;
+    }
+  }
+});
+
+redisClient.on('error', (err) => {
+  console.error('❌ Redis Client Error:', err);
+});
+
+redisClient.on('connect', () => {
+  console.log('🔄 Redis client connecting...');
+});
+
+redisClient.on('ready', () => {
+  console.log('✅ Redis client connected and ready');
+});
+
+redisClient.on('reconnecting', () => {
+  console.log('🔄 Redis client reconnecting...');
+});
+
+const redisStore = new RedisStore({   
+  client: redisClient,   
+  prefix: 'sess:',   
+  ttl: SESSION_MAX_AGE / 1000   
+});  
+
+// ============================================
+// Session Middleware (Existing)
+// ============================================
+
+const sessionMiddleware = session({
+  store: redisStore,
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: {
+    httpOnly: true,
+    secure: NODE_ENV === 'production',
+    sameSite: 'lax',
+    maxAge: SESSION_MAX_AGE,
+    path: '/'
+  },
+  name: 'connect.sid'
+});
+
+const corsOptions = {
+  origin: NODE_ENV === 'production' 
+    ? process.env.FRONTEND_URL || 'https://yourdomain.com'
+    : 'http://localhost:3000',
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+};
+
+// ============================================
+// NEW: Merged GraphQL Schema
+// ============================================
+
+/**
+ * Merge user and conversation schemas + resolvers
+ * 
+ * Schema Merging:
+ * - conversationSchema uses "extend type Query/Mutation/Subscription"
+ * - makeExecutableSchema combines all typeDefs and resolvers
+ * 
+ * Deep Merge Resolvers:
+ * - Combines userResolvers and conversationResolvers
+ * - If both define same type (e.g., Query), fields are merged
+ */
+const schema = makeExecutableSchema({
+  typeDefs: [userTypeDefs, conversationTypeDefs],
+  resolvers: [userResolvers, conversationResolvers]
+});
+
+// ============================================
+// NEW: WebSocket Server Configuration
+// ============================================
+
+/**
+ * Create WebSocket server for GraphQL subscriptions
+ * 
+ * Configuration:
+ * - server: Attach to existing HTTP server (shares port 4000)
+ * - path: '/graphql' (same endpoint as HTTP queries/mutations)
+ * 
+ * Protocol:
+ * - Uses graphql-ws protocol (NOT deprecated subscriptions-transport-ws)
+ * - Client must use graphql-ws compatible library (Apollo Client v3+)
+ * 
+ * Authentication Flow:
+ * 1. Client sends HTTP Upgrade request to ws://localhost:4000/graphql
+ * 2. Request includes Cookie header with session ID
+ * 3. onConnect extracts session, loads user from Redis + SQL
+ * 4. User added to WebSocket connection context
+ * 5. Subscription resolvers access context.user for authorization
+ */
+const wsServer = new WebSocketServer({
+  server: httpServer,
+  path: '/graphql'
+});
+
+/**
+ * Helper: Extract session from WebSocket connection
+ * 
+ * Problem:
+ * - express-session middleware only works for HTTP requests
+ * - WebSocket upgrade bypasses Express middleware stack
+ * 
+ * Solution:
+ * - Manually parse Cookie header
+ * - Use session middleware's store.get() to load session
+ * - Reconstruct context.user like HTTP requests
+ * 
+ * @param {Object} ctx - graphql-ws context (contains request object)
+ * @returns {Promise<Object>} - { user } or { user: null }
+ */
+async function getSessionFromWebSocket(ctx) {
+  const { request } = ctx.extra;
+  
+  if (!request.headers.cookie) {
+    return { user: null };
+  }
+
+  // Parse cookies manually (express-session not available)
+  const cookies = request.headers.cookie.split(';').reduce((acc, cookie) => {
+    const [key, value] = cookie.trim().split('=');
+    acc[key] = value;
+    return acc;
+  }, {});
+
+  const sessionId = cookies['connect.sid'];
+  
+  if (!sessionId) {
+    return { user: null };
+  }
+
+  // Remove signature from signed cookie (format: s:sessionId.signature)
+  const unsignedSessionId = sessionId.startsWith('s:') 
+    ? sessionId.slice(2).split('.')[0]
+    : sessionId;
+
+  // Load session from Redis
+  return new Promise((resolve) => {
+    redisStore.get(unsignedSessionId, async (err, session) => {
+      if (err || !session || !session.userId) {
+        return resolve({ user: null });
+      }
+
+      // Load user from SQL (same as HTTP context)
+      try {
+        const { findUserById } = require('./src/models/UserCore.js');
+        const user = await findUserById(session.userId);
+        resolve({ user });
+      } catch (error) {
+        console.error('Error loading user in WebSocket context:', error);
+        resolve({ user: null });
+      }
+    });
+  });
+}
+
+/**
+ * Configure graphql-ws server
+ * 
+ * Lifecycle Hooks:
+ * - onConnect: Authenticate WebSocket connection (runs once per connection)
+ * - onSubscribe: Validate subscription operation (runs per subscription)
+ * - onComplete: Clean up when subscription ends
+ * 
+ * Context:
+ * - Merged with subscription resolver context
+ * - Includes: { user, pubsub }
+ */
+const serverCleanup = useServer({
+  schema,
+  
+  /**
+   * Connection initialization
+   * Runs when client establishes WebSocket connection
+   * 
+   * Return value added to connectionParams (available in context)
+   */
+  onConnect: async (ctx) => {
+    console.log('🔌 WebSocket connection initiated');
+    
+    // Extract user from session
+    const { user } = await getSessionFromWebSocket(ctx);
+    
+    if (user) {
+      console.log(`✅ WebSocket authenticated: ${user.username} (${user.id})`);
+    } else {
+      console.log('⚠️  WebSocket connected without authentication (subscriptions will fail)');
+    }
+
+    // Return context (merged with subscription resolver context)
+    return { user };
+  },
+
+  /**
+   * Context builder for subscription resolvers
+   * Runs for each subscription operation
+   * 
+   * Merged Context:
+   * - ctx.connectionParams: From onConnect return value
+   * - ctx.extra: Raw WebSocket request object
+   * - pubsub: Singleton PubSub instance
+   */
+  context: async (ctx) => {
+    return {
+      ...ctx.connectionParams,  // Includes { user } from onConnect
+      pubsub
+    };
+  },
+
+  /**
+   * Subscription start hook
+   * Useful for logging/monitoring
+   */
+  onSubscribe: (ctx, msg) => {
+    console.log(`📡 Subscription started: ${msg.payload.query.substring(0, 50)}...`);
+  },
+
+  /**
+   * Subscription end hook
+   * Clean up resources if needed
+   */
+  onComplete: (ctx, msg) => {
+    console.log('🔌 Subscription completed');
+  }
+}, wsServer);
+
+// ============================================
+// Apollo Server Configuration
+// ============================================
+
+const apolloServer = new ApolloServer({
+  schema,  // Use merged schema (includes subscriptions)
+  
+  plugins: [
+    // Graceful shutdown for HTTP server
+    ApolloServerPluginDrainHttpServer({ httpServer }),
+    
+    // Graceful shutdown for WebSocket server
+    {
+      async serverWillStart() {
+        return {
+          async drainServer() {
+            await serverCleanup.dispose();
+          }
+        };
+      }
+    },
+    
+    // GraphQL Playground (development only)
+    ApolloServerPluginLandingPageGraphQLPlayground({
+      settings: {
+        'request.credentials': 'include',
+        // WebSocket endpoint configuration for Playground subscriptions
+        'subscriptions.endpoint': `ws://localhost:${PORT}/graphql`
+      }
+    })
+  ],
+  
+  introspection: NODE_ENV !== 'production',
+  
+  formatError: (formattedError, error) => {
+    console.error('GraphQL Error:', formattedError);
+    
+    if (NODE_ENV === 'production') {
+      if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR') {
+        return {
+          message: 'An internal error occurred',
+          extensions: { code: 'INTERNAL_SERVER_ERROR' }
+        };
+      }
+    }
+    
+    return formattedError;
+  }
+});
+
+// ============================================
+// Server Startup
+// ============================================
+
+async function startServer() {
+  try {
+    console.log('🚀 Starting GraphQL Authentication + Chat Server...\n');
+    
+    // Step 1: Connect to Redis
+    console.log('📡 Connecting to Redis...');
+    await redisClient.connect();
+    
+    // Step 2: Connect to MongoDB (NEW)
+    console.log('📡 Connecting to MongoDB...');
+    await connectMongoDB();
+    
+    // Step 3: Create MongoDB indexes (NEW)
+    console.log('📊 Creating MongoDB indexes...');
+    await createIndexes();
+    
+    // Step 4: Initialize Apollo Server
+    console.log('🔧 Initializing Apollo Server...');
+    await apolloServer.start();
+    
+    console.log('⚙️  Configuring Express middleware...\n');
+    
+    // Apply middleware in correct order
+    app.use(express.json());
+    app.use(express.urlencoded({ extended: true }));
+    app.use(cors(corsOptions));
+    app.use(sessionMiddleware);
+    
+    // GraphQL HTTP endpoint (queries/mutations)
+    app.use(
+      '/graphql',
+      expressMiddleware(apolloServer, {
+        context: async ({ req, res }) => {
+          const context = await buildContext({ req, res });
+          return {
+            ...context,
+            pubsub  // Add PubSub to context for mutations
+          };
+        }
+      })
+    );
+
+    // Health check endpoint
+    app.get('/health', async (req, res) => {
+      res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        uptime: process.uptime(),
+        redis: redisClient.isOpen ? 'connected' : 'disconnected',
+        mongodb: require('mongoose').connection.readyState === 1 ? 'connected' : 'disconnected'
+      });
+    });
+    
+    app.get('/', (req, res) => {
+      res.redirect('/graphql');
+    });
+    
+    // Start HTTP server (with WebSocket support)
+    httpServer.listen(PORT, () => {
+      console.log('✅ Server started successfully!\n');
+      console.log('📍 Server Information:');
+      console.log(`   - GraphQL HTTP: http://localhost:${PORT}/graphql`);
+      console.log(`   - GraphQL WebSocket: ws://localhost:${PORT}/graphql`);
+      console.log(`   - GraphQL Playground: http://localhost:${PORT}/graphql`);
+      console.log(`   - Health Check: http://localhost:${PORT}/health`);
+      console.log(`   - Environment: ${NODE_ENV}`);
+      console.log(`   - Redis: ${REDIS_HOST}:${REDIS_PORT}`);
+      console.log(`   - MongoDB: ${process.env.MONGODB_URI || 'Not configured'}`);
+      console.log(`   - Session Duration: ${SESSION_MAX_AGE / 1000 / 60 / 60 / 24} days\n`);
+      
+      console.log('🔐 Security Configuration:');
+      console.log(`   - HttpOnly Cookies: ✅`);
+      console.log(`   - Secure Cookies: ${NODE_ENV === 'production' ? '✅' : '⚠️  (disabled in dev)'}`);
+      console.log(`   - SameSite Policy: Lax`);
+      console.log(`   - WebSocket Auth: Cookie-based`);
+      console.log(`   - Bcrypt Salt Rounds: 12`);
+      console.log(`   - Session Store: Redis`);
+      console.log(`   - CORS Origin: ${corsOptions.origin}\n`);
+      
+      console.log('💬 Chat Features (Phase 1):');
+      console.log('   ✅ Create 1-on-1 conversations');
+      console.log('   ✅ Send real-time messages');
+      console.log('   ✅ Cursor-based pagination');
+      console.log('   ✅ WebSocket subscriptions\n');
+      
+      console.log('📖 Quick Start Guide:');
+      console.log('   1. Open http://localhost:4000/graphql in your browser');
+      console.log('   2. Enable "Request Credentials" in Playground settings');
+      console.log('   3. Run login mutation to authenticate');
+      console.log('   4. Run createConversation to start chat');
+      console.log('   5. Open subscription tab and subscribe to messageReceived');
+      console.log('   6. Run sendMessage to test real-time delivery\n');
+    });
+    
+  } catch (error) {
+    console.error('❌ Server startup failed:', error);
+    process.exit(1);
+  }
+}
+
+// ============================================
+// Graceful Shutdown
+// ============================================
+
+async function shutdown(signal) {
+  console.log(`\n📴 Received ${signal}, shutting down gracefully...`);
+  
+  try {
+    // Stop accepting new connections
+    await apolloServer.stop();
+    console.log('✅ Apollo Server stopped');
+    
+    // Close WebSocket connections
+    await serverCleanup.dispose();
+    console.log('✅ WebSocket server closed');
+    
+    // Close HTTP server
+    await new Promise((resolve) => httpServer.close(resolve));
+    console.log('✅ HTTP server closed');
+    
+    // Disconnect Redis
+    await redisClient.disconnect();
+    console.log('✅ Redis disconnected');
+    
+    // Disconnect MongoDB
+    await closeMongoConnection();
+    console.log('✅ MongoDB disconnected');
+    
+    // Close SQL pool
+    await closePool();
+    console.log('✅ SQL Server pool closed');
+    
+    console.log('👋 Shutdown complete');
+    process.exit(0);
+    
+  } catch (error) {
+    console.error('❌ Error during shutdown:', error);
+    process.exit(1);
+  }
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('uncaughtException', (error) => {
+  console.error('❌ Uncaught Exception:', error);
+  shutdown('uncaughtException');
+});
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+  shutdown('unhandledRejection');
+});
+
+startServer();
+DELIVERABLE 8: Updated package.json
+npm install mongoose graphql-ws ws @graphql-tools/schema graphql-subscriptions
