@@ -19,6 +19,9 @@ const { resolvers: userResolvers } = require('./src/graphql/resolvers/userResolv
 const { conversationTypeDefs } = require('./src/graphql/schemas/conversationSchema.js');
 const { conversationResolvers } = require('./src/graphql/resolvers/conversationResolver.js');
 
+const { typeDefs: friendTypeDefs } = require('./src/graphql/schemas/friendSchema.js');
+const { resolvers: friendResolvers } = require('./src/graphql/resolvers/friendResolver.js');
+
 const pubsubModule = require('./src/pubsub/events.js');
 
 const pubsub = pubsubModule.pubsub;
@@ -102,8 +105,8 @@ const corsOptions = {
 };
 
 const schema = makeExecutableSchema({
-  typeDefs: [userTypeDefs, conversationTypeDefs],
-  resolvers: [userResolvers, conversationResolvers]
+  typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs],
+  resolvers: [userResolvers, conversationResolvers, friendResolvers]
 });
 
 async function getSessionFromWebSocket(ctx) {
