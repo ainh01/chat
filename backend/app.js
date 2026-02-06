@@ -167,12 +167,26 @@ debugSession('RedisStore configured with TTL: %ds', SESSION_MAX_AGE / 1000);
 // ============================================================  
 // CORS & SESSION CONFIGURATION  
 // ============================================================  
-const ALLOWED_ORIGINS = [  
-  FRONTEND_URL,  
-BACKEND_URL,
-  'http://localhost:5500',  
-  'http://localhost:3000'  
-].filter(Boolean);  
+// ✅ NEW CODE with better defaults:
+const ALLOWED_ORIGINS = [
+  FRONTEND_URL,
+  BACKEND_URL,
+  'https://chat.xain.click',        // Add your actual frontend domains
+  'https://twchat.xain.click',      // Add your actual frontend domains
+  'http://localhost:5500',          // VSCode Live Server
+  'http://localhost:3000',          // Development
+  'http://127.0.0.1:5500',          // Alternative localhost
+  'http://127.0.0.1:3000'           // Alternative localhost
+].filter(Boolean).filter((v, i, a) => a.indexOf(v) === i); // Remove duplicates
+
+debugServer('Allowed CORS origins: %O', ALLOWED_ORIGINS);
+
+// Validation: Ensure we have at least some origins
+if (ALLOWED_ORIGINS.length === 0) {
+  debugError('No ALLOWED_ORIGINS configured - CORS will block all requests!');
+  process.exit(1);
+}
+
 
 debugServer('Allowed CORS origins: %O', ALLOWED_ORIGINS);  
 
@@ -522,11 +536,33 @@ async function startServer() {
 
     // Express middleware setup  
     debugServer('Configuring Express middleware...');  
-    app.use(express.json());  
-    app.use(express.urlencoded({ extended: true }));  
-    app.use(cors(corsOptions));  
-    app.use(sessionMiddleware);  
+app.use(cors(corsOptions));  // 1. CORS FIRST  
+app.use(sessionMiddleware);   // 2. Session second  
+app.use(express.json());      // 3. Body parsers last  
+app.use(express.urlencoded({ extended: true }));  
     debugServer('Express middleware configured');  
+
+    app.use((req, res, next) => {  
+  const origin = req.headers.origin || req.headers.referer || 'no-origin';  
+  
+  debugServer('📨 Incoming request:');  
+  debugServer('  Method: %s', req.method);  
+  debugServer('  Path: %s', req.path);  
+  debugServer('  Origin: %s', origin);  
+  debugServer('  Allowed Origins: %O', ALLOWED_ORIGINS);  
+  debugServer('  Origin Match: %s', ALLOWED_ORIGINS.includes(origin) ? '✅ YES' : '❌ NO');  
+  
+  // Log response headers after they're set  
+  const originalSend = res.send;  
+  res.send = function(data) {  
+    debugServer('📤 Response CORS Headers:');  
+    debugServer('  Access-Control-Allow-Origin: %s', res.getHeader('Access-Control-Allow-Origin') || 'NOT SET');  
+    debugServer('  Access-Control-Allow-Credentials: %s', res.getHeader('Access-Control-Allow-Credentials') || 'NOT SET');  
+    originalSend.call(this, data);  
+  };  
+  
+  next();  
+});  
 
     // GraphQL endpoint  
     debugApollo('Mounting GraphQL endpoint at /graphql');  
