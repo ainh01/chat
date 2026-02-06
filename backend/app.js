@@ -1,327 +1,627 @@
-const express = require('express');
-const http = require('http');
-const session = require('express-session');
-const RedisStore = require('connect-redis').default;
-const { createClient } = require('redis');
-const { ApolloServer } = require('@apollo/server');
-const { expressMiddleware } = require('@apollo/server/express4');
-const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer');
-const { ApolloServerPluginLandingPageGraphQLPlayground } = require('@apollo/server-plugin-landing-page-graphql-playground');
-const { makeExecutableSchema } = require('@graphql-tools/schema');
-const { WebSocketServer } = require('ws');
-const { useServer } = require('graphql-ws/use/ws');
-const cors = require('cors');
-const dotenv = require('dotenv');
+const express = require('express');  
+const http = require('http');  
+const session = require('express-session');  
+const RedisStore = require('connect-redis').default;  
+const { createClient } = require('redis');  
+const { ApolloServer } = require('@apollo/server');  
+const { expressMiddleware } = require('@apollo/server/express4');  
+const { ApolloServerPluginDrainHttpServer } = require('@apollo/server/plugin/drainHttpServer');  
+const { ApolloServerPluginLandingPageGraphQLPlayground } = require('@apollo/server-plugin-landing-page-graphql-playground');  
+const { makeExecutableSchema } = require('@graphql-tools/schema');  
+const { WebSocketServer } = require('ws');  
+const { useServer } = require('graphql-ws/use/ws');  
+const cors = require('cors');  
+const dotenv = require('dotenv');  
 
-const { typeDefs: userTypeDefs } = require('./src/graphql/schemas/userSchema.js');
-const { resolvers: userResolvers } = require('./src/graphql/resolvers/userResolver.js');
+// ============================================================  
+// DEBUG LOGGERS - Namespaced for selective enabling  
+// ============================================================  
+const debug = require('debug');  
+const debugRedis = debug('app:redis');  
+const debugWebSocket = debug('app:websocket');  
+const debugApollo = debug('app:apollo');  
+const debugDatabase = debug('app:database');  
+const debugSession = debug('app:session');  
+const debugServer = debug('app:server');  
+const debugError = debug('app:error');  
 
-const { conversationTypeDefs } = require('./src/graphql/schemas/conversationSchema.js');
-const { conversationResolvers } = require('./src/graphql/resolvers/conversationResolver.js');
+const { typeDefs: userTypeDefs } = require('./src/graphql/schemas/userSchema.js');  
+const { resolvers: userResolvers } = require('./src/graphql/resolvers/userResolver.js');  
 
-const { typeDefs: friendTypeDefs } = require('./src/graphql/schemas/friendSchema.js');
-const { resolvers: friendResolvers } = require('./src/graphql/resolvers/friendResolver.js');
+const { conversationTypeDefs } = require('./src/graphql/schemas/conversationSchema.js');  
+const { conversationResolvers } = require('./src/graphql/resolvers/conversationResolver.js');  
 
-const { typeDefs: callTypeDefs } = require('./src/graphql/schemas/callSchema.js');
-const { resolvers: callResolvers } = require('./src/graphql/resolvers/callResolver.js');
+const { typeDefs: friendTypeDefs } = require('./src/graphql/schemas/friendSchema.js');  
+const { resolvers: friendResolvers } = require('./src/graphql/resolvers/friendResolver.js');  
 
-const pubsubModule = require('./src/pubsub/events.js');
+const { typeDefs: callTypeDefs } = require('./src/graphql/schemas/callSchema.js');  
+const { resolvers: callResolvers } = require('./src/graphql/resolvers/callResolver.js');  
 
-const pubsub = pubsubModule.pubsub;
+const pubsubModule = require('./src/pubsub/events.js');  
 
-const { buildContext } = require('./src/middleware/auth.js');
-const { closePool } = require('./src/db/sql/db.js');
-const { connectMongoDB, closeMongoConnection } = require('./src/db/nosql/db.js');
-const { createIndexes } = require('./src/db/nosql/indexes.js');
+const pubsub = pubsubModule.pubsub;  
 
-const { createMessageLoader } = require('./src/loaders/messageLoader.js');
+const { buildContext } = require('./src/middleware/auth.js');  
+const { closePool } = require('./src/db/sql/db.js');  
+const { connectMongoDB, closeMongoConnection } = require('./src/db/nosql/db.js');  
+const { createIndexes } = require('./src/db/nosql/indexes.js');  
 
-dotenv.config();
+const { createMessageLoader } = require('./src/loaders/messageLoader.js');  
 
-const PORT = process.env.PORT || 4000;
-const REDIS_HOST = process.env.REDIS_HOST || 'localhost';
-const REDIS_PORT = process.env.REDIS_PORT || 6379;
-const SESSION_SECRET = process.env.SESSION_SECRET;
-const SESSION_MAX_AGE = parseInt(process.env.SESSION_MAX_AGE) || 604800000;
-const NODE_ENV = process.env.NODE_ENV || 'development';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+dotenv.config();  
 
-if (!SESSION_SECRET) {
-  process.exit(1);
-}
+const PORT = process.env.PORT || 4000;  
+const REDIS_HOST = process.env.REDIS_HOST || 'localhost';  
+const REDIS_PORT = process.env.REDIS_PORT || 6379;  
+const SESSION_SECRET = process.env.SESSION_SECRET;  
+const SESSION_MAX_AGE = parseInt(process.env.SESSION_MAX_AGE) || 604800000;  
+const NODE_ENV = process.env.NODE_ENV || 'development';  
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';  
 
-if (!pubsub) {
-  process.exit(1);
-}
-if (typeof pubsub.asyncIterator !== 'function' || typeof pubsub.publish !== 'function') {
-  process.exit(1);
-}
+debugServer('Environment: %s', NODE_ENV);  
+debugServer('Port: %d', PORT);  
+debugRedis('Redis configuration: %s:%d', REDIS_HOST, REDIS_PORT);  
 
-const app = express();
-const httpServer = http.createServer(app);
+if (!SESSION_SECRET) {  
+  debugError('SESSION_SECRET is not defined in environment variables');  
+  debugError('Application cannot start without session secret');  
+  process.exit(1);  
+}  
 
-const redisClient = createClient({
-  socket: {
-    host: REDIS_HOST,
-    port: REDIS_PORT,
-    reconnectStrategy: (retries) => {
-      if (retries > 10) {
-        return new Error('Redis connection failed');
-      }
-      const delay = Math.min(retries * 100, 3000);
-      return delay;
-    }
-  }
-});
+if (!pubsub) {  
+  debugError('PubSub module failed to initialize');  
+  process.exit(1);  
+}  
+if (typeof pubsub.asyncIterator !== 'function' || typeof pubsub.publish !== 'function') {  
+  debugError('PubSub interface validation failed - missing required methods');  
+  process.exit(1);  
+}  
 
-redisClient.on('error', (err) => { });
-redisClient.on('connect', () => { });
-redisClient.on('ready', () => { });
-redisClient.on('reconnecting', () => { });
+debugServer('PubSub initialized successfully');  
 
-const redisStore = new RedisStore({
-  client: redisClient,
-  prefix: 'sess:',
-  ttl: SESSION_MAX_AGE / 1000
-});
+const app = express();  
+const httpServer = http.createServer(app);  
 
-const sessionMiddleware = session({
-  store: redisStore,
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: SESSION_MAX_AGE,
-    path: '/'
-  },
-  name: 'connect.sid'
-});
+// ============================================================  
+// REDIS CLIENT CONFIGURATION WITH DEBUG LOGGING  
+// ============================================================  
+const redisClient = createClient({  
+  socket: {  
+    host: REDIS_HOST,  
+    port: REDIS_PORT,  
+    reconnectStrategy: (retries) => {  
+      debugRedis('Reconnection attempt #%d', retries);  
+      
+      if (retries > 10) {  
+        debugError('Redis max reconnection attempts exceeded (10)');  
+        return new Error('Redis connection failed');  
+      }  
+      
+      const delay = Math.min(retries * 100, 3000);  
+      debugRedis('Reconnecting in %dms', delay);  
+      return delay;  
+    }  
+  }  
+});  
 
-const corsOptions = {
-  origin: NODE_ENV === 'production' ? FRONTEND_URL : 'http://localhost:5500',
-  credentials: true,
-  methods: ['GET', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-};
+redisClient.on('error', (err) => {  
+  debugRedis('Redis client error: %s', err.message);  
+  debugError('Redis error: %O', {  
+    message: err.message,  
+    code: err.code,  
+    stack: err.stack  
+  });  
+});  
 
-const schema = makeExecutableSchema({
-  typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs, callTypeDefs],
-  resolvers: [userResolvers, conversationResolvers, friendResolvers, callResolvers]
-});
+redisClient.on('connect', () => {  
+  debugRedis('Redis client connecting to %s:%d', REDIS_HOST, REDIS_PORT);  
+});  
 
-async function getSessionFromWebSocket(ctx) {
-  const cookieHeader = ctx.extra?.request?.headers?.cookie;
+redisClient.on('ready', () => {  
+  debugRedis('Redis client ready - connection established successfully');  
+  debugRedis('Redis store prefix: sess:, TTL: %ds', SESSION_MAX_AGE / 1000);  
+});  
 
-  if (!cookieHeader) {
-    return { user: null };
-  }
+redisClient.on('reconnecting', () => {  
+  debugRedis('Redis client reconnecting...');  
+});  
 
-  const cookies = cookieHeader.split(';').reduce((acc, cookie) => {
-    const [key, value] = cookie.trim().split('=');
-    acc[key] = decodeURIComponent(value);
-    return acc;
-  }, {});
+const redisStore = new RedisStore({  
+  client: redisClient,  
+  prefix: 'sess:',  
+  ttl: SESSION_MAX_AGE / 1000  
+});  
 
-  const sessionId = cookies['connect.sid'];
+debugSession('RedisStore configured with TTL: %ds', SESSION_MAX_AGE / 1000);  
 
-  if (!sessionId) {
-    return { user: null };
-  }
+const sessionMiddleware = session({  
+  store: redisStore,  
+  secret: SESSION_SECRET,  
+  resave: false,  
+  saveUninitialized: false,  
+  cookie: {  
+    httpOnly: true,  
+    secure: NODE_ENV === 'production',  
+    sameSite: 'lax',  
+    maxAge: SESSION_MAX_AGE,  
+    path: '/'  
+  },  
+  name: 'connect.sid'  
+});  
 
-  const unsignedSessionId = sessionId.startsWith('s:')
-    ? sessionId.slice(2).split('.')[0]
-    : sessionId;
+debugSession('Session middleware configured: httpOnly=%s, secure=%s, sameSite=lax, maxAge=%dms',   
+  true, NODE_ENV === 'production', SESSION_MAX_AGE);  
 
-  return new Promise((resolve) => {
-    redisStore.get(unsignedSessionId, async (err, session) => {
-      if (err) {
-        return resolve({ user: null });
-      }
-      if (!session || !session.userId) {
-        return resolve({ user: null });
-      }
+const corsOptions = {  
+  origin: NODE_ENV === 'production' ? FRONTEND_URL : 'http://localhost:5500',  
+  credentials: true,  
+  methods: ['GET', 'POST', 'OPTIONS'],  
+  allowedHeaders: ['Content-Type', 'Authorization']  
+};  
 
-      try {
-        const { findUserById } = require('./src/models/UserCore.js');
-        const user = await findUserById(session.userId);
-        resolve({ user });
-      } catch (error) {
-        resolve({ user: null });
-      }
-    });
-  });
-}
+debugServer('CORS configured for origin: %s', corsOptions.origin);  
 
-const wsServer = new WebSocketServer({
-  server: httpServer,
-  path: '/graphql',
-  handleProtocols: (protocols) => {
-    if (protocols.includes('graphql-transport-ws')) return 'graphql-transport-ws';
-    if (protocols.includes('graphql-ws')) return 'graphql-ws';
-    return false;
-  }
-});
+const schema = makeExecutableSchema({  
+  typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs, callTypeDefs],  
+  resolvers: [userResolvers, conversationResolvers, friendResolvers, callResolvers]  
+});  
 
-const serverCleanup = useServer({
-  schema,
-  onConnect: async (ctx) => {
-    const { user } = await getSessionFromWebSocket(ctx);
+debugApollo('GraphQL schema created with 4 type definition modules');  
 
-    if (user) {
-      ctx.extra.user = user;
-    }
-    return true;
-  },
+// ============================================================  
+// WEBSOCKET SESSION AUTHENTICATION WITH DEBUG LOGGING  
+// ============================================================  
+async function getSessionFromWebSocket(ctx) {  
+  const cookieHeader = ctx.extra?.request?.headers?.cookie;  
 
-  context: async (ctx) => {
-    const user = ctx.extra?.user || null;
+  if (!cookieHeader) {  
+    debugSession('WebSocket connection attempt without cookies');  
+    return { user: null };  
+  }  
 
-    return {
-      user,
-      pubsub,
-      redisClient,
-      messageLoader: createMessageLoader()
-    };
-  },
+  const cookies = cookieHeader.split(';').reduce((acc, cookie) => {  
+    const [key, value] = cookie.trim().split('=');  
+    acc[key] = decodeURIComponent(value);  
+    return acc;  
+  }, {});  
 
-  onSubscribe: (ctx, msg) => {
-    const query = msg.payload?.query || msg.query || 'Unknown Subscription Query';
-    const operationName = msg.payload?.operationName || 'N/A';
-  },
+  const sessionId = cookies['connect.sid'];  
 
-  onComplete: (ctx, msg) => {
-  },
+  if (!sessionId) {  
+    debugSession('WebSocket connection missing connect.sid cookie');  
+    return { user: null };  
+  }  
 
-  onError: (ctx, msg, errors) => {
-  }
-}, wsServer);
+  const unsignedSessionId = sessionId.startsWith('s:')  
+    ? sessionId.slice(2).split('.')[0]  
+    : sessionId;  
 
-wsServer.on('connection', (ws, request) => { });
-wsServer.on('error', (error) => { });
-wsServer.on('close', () => { });
+  debugSession('Retrieving session for WebSocket: %s', unsignedSessionId.substring(0, 8) + '...');  
 
-const apolloServer = new ApolloServer({
-  schema,
-  plugins: [
-    ApolloServerPluginDrainHttpServer({ httpServer }),
-    {
-      async serverWillStart() {
-        return {
-          async drainServer() {
-            await serverCleanup.dispose();
-          }
-        };
-      }
-    },
-    ApolloServerPluginLandingPageGraphQLPlayground({
-      settings: {
-        'request.credentials': 'include',
-        'subscriptions.endpoint': `ws://localhost:${PORT}/graphql`
-      }
-    })
-  ],
-  introspection: NODE_ENV !== 'production',
+  return new Promise((resolve) => {  
+    redisStore.get(unsignedSessionId, async (err, session) => {  
+      if (err) {  
+        debugError('Session retrieval error for WebSocket: %s', err.message);  
+        return resolve({ user: null });  
+      }  
+      if (!session || !session.userId) {  
+        debugSession('WebSocket session not found or missing userId');  
+        return resolve({ user: null });  
+      }  
 
-  formatError: (formattedError, error) => {
+      try {  
+        const { findUserById } = require('./src/models/UserCore.js');  
+        const user = await findUserById(session.userId);  
+        
+        if (user) {  
+          debugSession('WebSocket authenticated: userId=%s, username=%s',   
+            user.id, user.username || 'N/A');  
+        } else {  
+          debugSession('WebSocket session userId=%s not found in database', session.userId);  
+        }  
+        
+        resolve({ user });  
+      } catch (error) {  
+        debugError('Error fetching user for WebSocket session: %s', error.message);  
+        resolve({ user: null });  
+      }  
+    });  
+  });  
+}  
 
-    if (NODE_ENV === 'production') {
-      if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR' || formattedError.message.includes('Internal server error')) {
-        return {
-          message: 'An unexpected internal error occurred.',
-          extensions: { code: 'INTERNAL_SERVER_ERROR' }
-        };
-      }
-    }
-    return formattedError;
-  }
-});
+// ============================================================  
+// WEBSOCKET SERVER CONFIGURATION WITH DEBUG LOGGING  
+// ============================================================  
+const wsServer = new WebSocketServer({  
+  server: httpServer,  
+  path: '/graphql',  
+  handleProtocols: (protocols) => {  
+    debugWebSocket('Client protocol negotiation: %O', protocols);  
+    
+    if (protocols.includes('graphql-transport-ws')) {  
+      debugWebSocket('Selected protocol: graphql-transport-ws');  
+      return 'graphql-transport-ws';  
+    }  
+    if (protocols.includes('graphql-ws')) {  
+      debugWebSocket('Selected protocol: graphql-ws');  
+      return 'graphql-ws';  
+    }  
+    
+    debugWebSocket('No supported protocol found');  
+    return false;  
+  }  
+});  
 
-async function startServer() {
-  try {
+debugWebSocket('WebSocket server created on path: /graphql');  
 
-    await redisClient.connect();
+const serverCleanup = useServer({  
+  schema,  
+  onConnect: async (ctx) => {  
+    const clientIp = ctx.extra?.request?.socket?.remoteAddress || 'unknown';  
+    debugWebSocket('New WebSocket connection from IP: %s', clientIp);  
+    
+    const { user } = await getSessionFromWebSocket(ctx);  
 
-    await connectMongoDB();
+    if (user) {  
+      ctx.extra.user = user;  
+      debugWebSocket('WebSocket authenticated: userId=%s', user.id);  
+    } else {  
+      debugWebSocket('WebSocket connection unauthenticated');  
+    }  
+    
+    return true;  
+  },  
 
-    await createIndexes();
+  context: async (ctx) => {  
+    const user = ctx.extra?.user || null;  
+    
+    debugWebSocket('Creating WebSocket context: authenticated=%s', !!user);  
 
-    await apolloServer.start();
+    return {  
+      user,  
+      pubsub,  
+      redisClient,  
+      messageLoader: createMessageLoader()  
+    };  
+  },  
 
-    app.use(express.json());
-    app.use(express.urlencoded({ extended: true }));
-    app.use(cors(corsOptions));
-    app.use(sessionMiddleware);
+  onSubscribe: (ctx, msg) => {  
+    const query = msg.payload?.query || msg.query || 'Unknown Subscription Query';  
+    const operationName = msg.payload?.operationName || 'N/A';  
+    const user = ctx.extra?.user;  
+    
+    debugWebSocket('Subscription started: operation=%s, userId=%s, subscriptionId=%s',   
+      operationName,   
+      user ? user.id : 'anonymous',  
+      msg.id || 'N/A'  
+    );  
+    
+    debugWebSocket('Subscription query preview: %s',   
+      query.substring(0, 100).replace(/\s+/g, ' ')  
+    );  
+  },  
 
-    app.use(
-      '/graphql',
-      expressMiddleware(apolloServer, {
-        context: async ({ req, res }) => {
-          const context = await buildContext({ req, res });
-          return {
-            ...context,
-            pubsub,
-            redisClient,
-            messageLoader: createMessageLoader()
-          };
-        }
-      })
-    );
+  onComplete: (ctx, msg) => {  
+    const user = ctx.extra?.user;  
+    const subscriptionId = msg.id || 'N/A';  
+    
+    debugWebSocket('Subscription completed: subscriptionId=%s, userId=%s',   
+      subscriptionId,  
+      user ? user.id : 'anonymous'  
+    );  
+  },  
 
-    app.get('/health', async (req, res) => {
-      const mongoose = require('mongoose');
-      res.json({
-        status: 'ok',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        redis: redisClient.isOpen ? 'connected' : 'disconnected',
-        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
-        pubsub: (typeof pubsub.asyncIterator === 'function' && typeof pubsub.publish === 'function') ? 'initialized' : 'error'
-      });
-    });
+  onError: (ctx, msg, errors) => {  
+    const user = ctx.extra?.user;  
+    const operationName = msg?.payload?.operationName || 'Unknown';  
+    
+    debugError('WebSocket subscription error: operation=%s, userId=%s, errorCount=%d',  
+      operationName,  
+      user ? user.id : 'anonymous',  
+      errors.length  
+    );  
+    
+    errors.forEach((error, index) => {  
+      debugError('Subscription error #%d: %s', index + 1, error.message);  
+      if (error.stack) {  
+        debugError('Stack trace: %s', error.stack);  
+      }  
+    });  
+  }  
+}, wsServer);  
 
-    app.get('/', (req, res) => {
-      res.redirect('/graphql');
-    });
+wsServer.on('connection', (ws, request) => {  
+  const clientIp = request.socket.remoteAddress;  
+  const url = request.url;  
+  
+  debugWebSocket('WebSocket connection established: ip=%s, url=%s', clientIp, url);  
+  debugWebSocket('Active connections: %d', wsServer.clients.size);  
+  
+  ws.on('close', (code, reason) => {  
+    debugWebSocket('WebSocket client disconnected: ip=%s, code=%d, reason=%s',  
+      clientIp,  
+      code,  
+      reason.toString() || 'none'  
+    );  
+    debugWebSocket('Active connections: %d', wsServer.clients.size);  
+  });  
+});  
 
-    httpServer.listen(PORT, () => { });
+wsServer.on('error', (error) => {  
+  debugError('WebSocket server error: %s', error.message);  
+  debugError('WebSocket error details: %O', {  
+    message: error.message,  
+    code: error.code,  
+    stack: error.stack  
+  });  
+});  
 
-  } catch (error) {
-    process.exit(1);
-  }
-}
+wsServer.on('close', () => {  
+  debugWebSocket('WebSocket server closed');  
+});  
 
-async function shutdown(signal) {
+// ============================================================  
+// APOLLO SERVER CONFIGURATION WITH DEBUG LOGGING  
+// ============================================================  
+const apolloServer = new ApolloServer({  
+  schema,  
+  plugins: [  
+    ApolloServerPluginDrainHttpServer({ httpServer }),  
+    {  
+      async serverWillStart() {  
+        debugApollo('Apollo Server starting...');  
+        return {  
+          async drainServer() {  
+            debugApollo('Draining Apollo Server connections...');  
+            await serverCleanup.dispose();  
+            debugApollo('WebSocket server cleanup completed');  
+          }  
+        };  
+      }  
+    },  
+    ApolloServerPluginLandingPageGraphQLPlayground({  
+      settings: {  
+        'request.credentials': 'include',  
+        'subscriptions.endpoint': `ws://localhost:${PORT}/graphql`  
+      }  
+    })  
+  ],  
+  introspection: NODE_ENV !== 'production',  
 
-  try {
-    await apolloServer.stop();
+  formatError: (formattedError, error) => {  
+    debugError('GraphQL error: %s', formattedError.message);  
+    debugError('Error code: %s', formattedError.extensions?.code || 'N/A');  
+    
+    if (formattedError.path) {  
+      debugError('Error path: %O', formattedError.path);  
+    }  
+    
+    if (error.originalError) {  
+      debugError('Original error: %s', error.originalError.message);  
+      debugError('Stack trace: %s', error.originalError.stack);  
+    }  
 
-    await serverCleanup.dispose();
+    if (NODE_ENV === 'production') {  
+      if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR' ||   
+          formattedError.message.includes('Internal server error')) {  
+        debugError('Sanitizing internal error for production response');  
+        return {  
+          message: 'An unexpected internal error occurred.',  
+          extensions: { code: 'INTERNAL_SERVER_ERROR' }  
+        };  
+      }  
+    }  
+    return formattedError;  
+  }  
+});  
 
-    await new Promise((resolve) => httpServer.close(resolve));
+debugApollo('Apollo Server configured: introspection=%s, playground=%s',  
+  NODE_ENV !== 'production',  
+  true  
+);  
 
-    await redisClient.disconnect();
+// ============================================================  
+// SERVER STARTUP WITH DEBUG LOGGING  
+// ============================================================  
+async function startServer() {  
+  const startTime = Date.now();  
+  debugServer('Starting server initialization...');  
+  
+  try {  
+    // Redis connection  
+    debugRedis('Connecting to Redis...');  
+    await redisClient.connect();  
+    debugRedis('Redis connected successfully');  
 
-    await closeMongoConnection();
+    // MongoDB connection  
+    debugDatabase('Connecting to MongoDB...');  
+    await connectMongoDB();  
+    debugDatabase('MongoDB connected successfully');  
 
-    await closePool();
+    // Create indexes  
+    debugDatabase('Creating MongoDB indexes...');  
+    await createIndexes();  
+    debugDatabase('MongoDB indexes created successfully');  
 
-    process.exit(0);
+    // Apollo Server startup  
+    debugApollo('Starting Apollo Server...');  
+    await apolloServer.start();  
+    debugApollo('Apollo Server started successfully');  
 
-  } catch (error) {
-    process.exit(1);
-  }
-}
+    // Express middleware setup  
+    debugServer('Configuring Express middleware...');  
+    app.use(express.json());  
+    app.use(express.urlencoded({ extended: true }));  
+    app.use(cors(corsOptions));  
+    app.use(sessionMiddleware);  
+    debugServer('Express middleware configured');  
 
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('uncaughtException', (error) => {
-  shutdown('uncaughtException');
-});
-process.on('unhandledRejection', (reason, promise) => {
-  shutdown('unhandledRejection');
-});
+    // GraphQL endpoint  
+    debugApollo('Mounting GraphQL endpoint at /graphql');  
+    app.use(  
+      '/graphql',  
+      expressMiddleware(apolloServer, {  
+        context: async ({ req, res }) => {  
+          const userId = req.session?.userId;  
+          
+          if (userId) {  
+            debugSession('GraphQL request with session: userId=%s', userId);  
+          }  
+          
+          const context = await buildContext({ req, res });  
+          return {  
+            ...context,  
+            pubsub,  
+            redisClient,  
+            messageLoader: createMessageLoader()  
+          };  
+        }  
+      })  
+    );  
 
-startServer();
+    // Health check endpoint  
+    app.get('/health', async (req, res) => {  
+      const mongoose = require('mongoose');  
+      
+      const healthData = {  
+        status: 'ok',  
+        timestamp: new Date().toISOString(),  
+        uptime: process.uptime(),  
+        redis: redisClient.isOpen ? 'connected' : 'disconnected',  
+        mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',  
+        pubsub: (typeof pubsub.asyncIterator === 'function' && typeof pubsub.publish === 'function') ? 'initialized' : 'error'  
+      };  
+      
+      debugServer('Health check: %O', healthData);  
+      res.json(healthData);  
+    });  
+
+    app.get('/', (req, res) => {  
+      debugServer('Root endpoint accessed, redirecting to /graphql');  
+      res.redirect('/graphql');  
+    });  
+
+    // Start HTTP server  
+    httpServer.listen(PORT, () => {  
+      const elapsedTime = Date.now() - startTime;  
+      
+      debugServer('═══════════════════════════════════════════════════');  
+      debugServer('🚀 Server started successfully in %dms', elapsedTime);  
+      debugServer('═══════════════════════════════════════════════════');  
+      debugServer('Environment: %s', NODE_ENV);  
+      debugServer('Port: %d', PORT);  
+      debugServer('GraphQL Endpoint: http://localhost:%d/graphql', PORT);  
+      debugServer('WebSocket Endpoint: ws://localhost:%d/graphql', PORT);  
+      debugServer('Health Check: http://localhost:%d/health', PORT);  
+      debugServer('═══════════════════════════════════════════════════');  
+      
+      console.log(`🚀 Server ready at http://localhost:${PORT}/graphql`);  
+      console.log(`🔌 WebSocket ready at ws://localhost:${PORT}/graphql`);  
+      console.log(`💚 Health check at http://localhost:${PORT}/health`);  
+    });  
+
+  } catch (error) {  
+    debugError('Server startup failed: %s', error.message);  
+    debugError('Error stack: %s', error.stack);  
+    debugError('Fatal error during initialization - exiting process');  
+    
+    console.error('❌ Server startup failed:', error.message);  
+    process.exit(1);  
+  }  
+}  
+
+// ============================================================  
+// GRACEFUL SHUTDOWN WITH DEBUG LOGGING  
+// ============================================================  
+async function shutdown(signal) {  
+  debugServer('Received %s signal - initiating graceful shutdown', signal);  
+  debugServer('═══════════════════════════════════════════════════');  
+  
+  const shutdownStart = Date.now();  
+
+  try {  
+    // Stop Apollo Server  
+    debugApollo('Stopping Apollo Server...');  
+    await apolloServer.stop();  
+    debugApollo('Apollo Server stopped');  
+
+    // Cleanup WebSocket server  
+    debugWebSocket('Disposing WebSocket server...');  
+    await serverCleanup.dispose();  
+    debugWebSocket('WebSocket server disposed, active connections: 0');  
+
+    // Close HTTP server  
+    debugServer('Closing HTTP server...');  
+    await new Promise((resolve) => httpServer.close(resolve));  
+    debugServer('HTTP server closed');  
+
+    // Disconnect Redis  
+    debugRedis('Disconnecting Redis client...');  
+    await redisClient.disconnect();  
+    debugRedis('Redis disconnected');  
+
+    // Close MongoDB  
+    debugDatabase('Closing MongoDB connection...');  
+    await closeMongoConnection();  
+    debugDatabase('MongoDB connection closed');  
+
+    // Close SQL pool  
+    debugDatabase('Closing SQL connection pool...');  
+    await closePool();  
+    debugDatabase('SQL connection pool closed');  
+
+    const shutdownTime = Date.now() - shutdownStart;  
+    debugServer('═══════════════════════════════════════════════════');  
+    debugServer('✅ Graceful shutdown completed in %dms', shutdownTime);  
+    debugServer('═══════════════════════════════════════════════════');  
+
+    process.exit(0);  
+
+  } catch (error) {  
+    debugError('Error during shutdown: %s', error.message);  
+    debugError('Shutdown error stack: %s', error.stack);  
+    debugError('Forcing process exit due to shutdown error');  
+    
+    console.error('❌ Shutdown error:', error.message);  
+    process.exit(1);  
+  }  
+}  
+
+// ============================================================  
+// PROCESS EVENT HANDLERS WITH DEBUG LOGGING  
+// ============================================================  
+process.on('SIGINT', () => {  
+  debugServer('SIGINT received (Ctrl+C)');  
+  shutdown('SIGINT');  
+});  
+
+process.on('SIGTERM', () => {  
+  debugServer('SIGTERM received');  
+  shutdown('SIGTERM');  
+});  
+
+process.on('uncaughtException', (error) => {  
+  debugError('Uncaught Exception: %s', error.message);  
+  debugError('Exception stack: %s', error.stack);  
+  debugError('Process state may be corrupted - initiating shutdown');  
+  
+  console.error('❌ Uncaught Exception:', error);  
+  shutdown('uncaughtException');  
+});  
+
+process.on('unhandledRejection', (reason, promise) => {  
+  debugError('Unhandled Promise Rejection at: %O', promise);  
+  debugError('Rejection reason: %s', reason);  
+  
+  if (reason && reason.stack) {  
+    debugError('Rejection stack: %s', reason.stack);  
+  }  
+  
+  console.error('❌ Unhandled Rejection:', reason);  
+  shutdown('unhandledRejection');  
+});  
+
+debugServer('Process event handlers registered');  
+
+// Start the server  
+startServer();  
