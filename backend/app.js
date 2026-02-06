@@ -56,6 +56,7 @@ const SESSION_SECRET = process.env.SESSION_SECRET;
 const SESSION_MAX_AGE = parseInt(process.env.SESSION_MAX_AGE) || 604800000;  
 const NODE_ENV = process.env.NODE_ENV || 'development';  
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';  
+const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:4000';  
 
 debugServer('Environment: %s', NODE_ENV);  
 debugServer('Port: %d', PORT);  
