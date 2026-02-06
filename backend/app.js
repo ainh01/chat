@@ -163,6 +163,38 @@ const redisStore = new RedisStore({
 
 debugSession('RedisStore configured with TTL: %ds', SESSION_MAX_AGE / 1000);  
 
+// ============================================================  
+// CORS & SESSION CONFIGURATION  
+// ============================================================  
+const ALLOWED_ORIGINS = [  
+  FRONTEND_URL,  
+  'http://localhost:5500',  
+  'http://localhost:3000'  
+].filter(Boolean);  
+
+debugServer('Allowed CORS origins: %O', ALLOWED_ORIGINS);  
+
+const corsOptions = {  
+  origin: function (origin, callback) {  
+    // Allow requests with no origin (mobile apps, Postman, etc.)  
+    if (!origin) return callback(null, true);  
+
+    if (ALLOWED_ORIGINS.includes(origin)) {  
+      callback(null, true);  
+    } else {  
+      debugError('CORS blocked origin: %s', origin);  
+      callback(new Error('Not allowed by CORS'));  
+    }  
+  },  
+  credentials: true,  
+  methods: ['GET', 'POST', 'OPTIONS'],  
+  allowedHeaders: ['Content-Type', 'Authorization', 'Apollo-Require-Preflight'],  
+  exposedHeaders: ['Set-Cookie'],  
+  maxAge: 86400 // 24 hours  
+};  
+
+debugServer('CORS configured for origins: %O', ALLOWED_ORIGINS);  
+
 const sessionMiddleware = session({  
   store: redisStore,  
   secret: SESSION_SECRET,  
@@ -171,24 +203,21 @@ const sessionMiddleware = session({
   cookie: {  
     httpOnly: true,  
     secure: NODE_ENV === 'production',  
-    sameSite: 'lax',  
+    sameSite: NODE_ENV === 'production' ? 'none' : 'lax', // ✅ Changed for cross-origin  
     maxAge: SESSION_MAX_AGE,  
+    domain: NODE_ENV === 'production' ? undefined : undefined, // Let browser handle it  
     path: '/'  
   },  
-  name: 'connect.sid'  
+  name: 'connect.sid',  
+  proxy: NODE_ENV === 'production' // ✅ Trust proxy in production  
 });  
 
-debugSession('Session middleware configured: httpOnly=%s, secure=%s, sameSite=lax, maxAge=%dms',  
-  true, NODE_ENV === 'production', SESSION_MAX_AGE);  
-
-const corsOptions = {  
-  origin: NODE_ENV === 'production' ? FRONTEND_URL : 'http://localhost:5500',  
-  credentials: true,  
-  methods: ['GET', 'POST', 'OPTIONS'],  
-  allowedHeaders: ['Content-Type', 'Authorization']  
-};  
-
-debugServer('CORS configured for origin: %s', corsOptions.origin);  
+debugSession('Session middleware configured: httpOnly=%s, secure=%s, sameSite=%s, maxAge=%dms',  
+  true,  
+  NODE_ENV === 'production',  
+  NODE_ENV === 'production' ? 'none' : 'lax',  
+  SESSION_MAX_AGE  
+);  
 
 const schema = makeExecutableSchema({  
   typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs, callTypeDefs],  
@@ -264,6 +293,16 @@ async function getSessionFromWebSocket(ctx) {
 const wsServer = new WebSocketServer({  
   server: httpServer,  
   path: '/graphql',  
+  verifyClient: (info, callback) => {  
+    const origin = info.origin || info.req.headers.origin;  
+
+    if (!origin || ALLOWED_ORIGINS.includes(origin)) {  
+      callback(true);  
+    } else {  
+      debugError('WebSocket connection rejected from origin: %s', origin);  
+      callback(false, 403, 'Forbidden');  
+    }  
+  },  
   handleProtocols: (protocols) => {  
     debugWebSocket('Client protocol negotiation: %O', protocols);  
 
@@ -411,7 +450,9 @@ const apolloServer = new ApolloServer({
     ApolloServerPluginLandingPageGraphQLPlayground({  
       settings: {  
         'request.credentials': 'include',  
-        'subscriptions.endpoint': `ws://localhost:${PORT}/graphql`  
+        'subscriptions.endpoint': NODE_ENV === 'production'  
+          ? `wss://${new URL(FRONTEND_URL).hostname}/graphql`  
+          : `ws://localhost:${PORT}/graphql`  
       }  
     })  
   ],  
