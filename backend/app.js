@@ -22,6 +22,9 @@ const { conversationResolvers } = require('./src/graphql/resolvers/conversationR
 const { typeDefs: friendTypeDefs } = require('./src/graphql/schemas/friendSchema.js');
 const { resolvers: friendResolvers } = require('./src/graphql/resolvers/friendResolver.js');
 
+const { typeDefs: callTypeDefs } = require('./src/graphql/schemas/callSchema.js');
+const { resolvers: callResolvers } = require('./src/graphql/resolvers/callResolver.js');
+
 const pubsubModule = require('./src/pubsub/events.js');
 
 const pubsub = pubsubModule.pubsub;
@@ -98,15 +101,15 @@ const sessionMiddleware = session({
 });
 
 const corsOptions = {
-  origin: NODE_ENV === 'production' ? FRONTEND_URL : 'http://localhost:3000',
+  origin: NODE_ENV === 'production' ? FRONTEND_URL : 'http://localhost:5500',
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 };
 
 const schema = makeExecutableSchema({
-  typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs],
-  resolvers: [userResolvers, conversationResolvers, friendResolvers]
+  typeDefs: [userTypeDefs, conversationTypeDefs, friendTypeDefs, callTypeDefs],
+  resolvers: [userResolvers, conversationResolvers, friendResolvers, callResolvers]
 });
 
 async function getSessionFromWebSocket(ctx) {
@@ -196,8 +199,7 @@ const serverCleanup = useServer({
   }
 }, wsServer);
 
-wsServer.on('connection', (ws, request) => {
-});
+wsServer.on('connection', (ws, request) => { });
 wsServer.on('error', (error) => { });
 wsServer.on('close', () => { });
 
@@ -284,8 +286,7 @@ async function startServer() {
       res.redirect('/graphql');
     });
 
-    httpServer.listen(PORT, () => {
-    });
+    httpServer.listen(PORT, () => { });
 
   } catch (error) {
     process.exit(1);

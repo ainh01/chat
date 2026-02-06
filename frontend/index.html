@@ -1,0 +1,1171 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Chat Interface</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family: monospace;
+        font-size: 12px;
+        display: grid;
+        grid-template-columns: 200px 1fr 300px;
+        height: 100vh;
+      }
+
+      #friendsPanel {
+        border-right: 1px solid #000;
+        overflow-y: auto;
+        padding: 10px;
+      }
+      #friendsPanel h3 {
+        margin-bottom: 10px;
+      }
+      .friend {
+        padding: 8px;
+        cursor: pointer;
+        border: 1px solid #ccc;
+        margin-bottom: 5px;
+      }
+      .friend:hover {
+        background: #f0f0f0;
+      }
+      .friend.online {
+        border-left: 3px solid green;
+      }
+
+      #chatPanel {
+        display: flex;
+        flex-direction: column;
+      }
+      #chatHeader {
+        padding: 10px;
+        border-bottom: 1px solid #000;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+      }
+
+      #messagesContainer {
+        flex: 1;
+        overflow-y: auto;
+        padding: 10px;
+        display: flex;
+        flex-direction: column-reverse;
+        max-height: calc(100vh - 200px);
+        min-height: 300px;
+      }
+      #messagesList {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .message {
+        margin: 8px 0;
+        padding: 8px;
+        border: 1px solid #ccc;
+        background: #fff;
+        position: relative;
+      }
+      .message.selected {
+        border: 2px solid blue;
+        background: #e3f2fd;
+      }
+      .message:hover {
+        background: #f5f5f5;
+      }
+      .message-header {
+        font-weight: bold;
+        margin-bottom: 4px;
+        display: flex;
+        justify-content: space-between;
+      }
+      .message-content {
+        margin: 4px 0;
+      }
+      .message-meta {
+        font-size: 10px;
+        color: #666;
+        margin-top: 4px;
+      }
+      .message.unsent .message-content {
+        font-style: italic;
+        color: #999;
+      }
+      .message.edited .message-content::after {
+        content: " (edited)";
+        font-size: 10px;
+        color: #666;
+      }
+      .message.forwarded::before {
+        content: "↪ ";
+        color: #666;
+      }
+      .reply-preview {
+        font-size: 10px;
+        color: #666;
+        padding: 4px;
+        border-left: 2px solid #999;
+        margin-bottom: 4px;
+        background: #f9f9f9;
+      }
+      .reactions {
+        display: flex;
+        gap: 5px;
+        margin-top: 4px;
+      }
+      .reaction {
+        padding: 2px 6px;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        font-size: 10px;
+        background: #fff3cd;
+      }
+      .read-status {
+        font-size: 10px;
+        color: green;
+        text-align: right;
+      }
+
+      #loadMoreBtn {
+        display: none;
+      }
+
+      #typingIndicator {
+        font-style: italic;
+        color: #666;
+        min-height: 20px;
+        padding: 5px 10px;
+        font-size: 11px;
+        background: #f9f9f9;
+        border-top: 1px solid #e0e0e0;
+      }
+
+      #inputArea {
+        border-top: 1px solid #000;
+        padding: 10px;
+      }
+      #replyingTo {
+        padding: 5px;
+        background: #ffffcc;
+        font-size: 10px;
+        display: none;
+      }
+      #messageInput {
+        width: 100%;
+        padding: 8px;
+        border: 1px solid #000;
+        margin-bottom: 5px;
+      }
+      #inputButtons {
+        display: flex;
+        gap: 5px;
+      }
+      #inputButtons button {
+        padding: 6px 12px;
+        cursor: pointer;
+        border: 1px solid #000;
+        background: #fff;
+      }
+
+      #actionsPanel {
+        border-left: 1px solid #000;
+        overflow-y: auto;
+        padding: 10px;
+      }
+      #actionsPanel h3 {
+        margin: 15px 0 10px 0;
+      }
+      #actionsPanel button {
+        width: 100%;
+        padding: 8px;
+        margin: 5px 0;
+        cursor: pointer;
+        border: 1px solid #000;
+        background: #fff;
+      }
+      #actionsPanel button:hover {
+        background: #f0f0f0;
+      }
+      #actionsPanel button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+      }
+      .info-box {
+        padding: 8px;
+        border: 1px solid #ccc;
+        margin: 10px 0;
+        background: #f9f9f9;
+        font-size: 11px;
+      }
+
+      #forwardModal {
+        display: none;
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        background: white;
+        border: 2px solid #000;
+        padding: 20px;
+        z-index: 1000;
+      }
+      #forwardModal.show {
+        display: block;
+      }
+      #modalOverlay {
+        display: none;
+        position: fixed;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: rgba(0, 0, 0, 0.5);
+        z-index: 999;
+      }
+      #modalOverlay.show {
+        display: block;
+      }
+
+      .error-box {
+        background: #ffebee;
+        border: 1px solid #f44336;
+        padding: 10px;
+        margin: 10px 0;
+        color: #c62828;
+        font-size: 11px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="friendsPanel">
+      <h3>Friends</h3>
+      <div id="friendsList"></div>
+    </div>
+
+    <div id="chatPanel">
+      <div id="chatHeader">
+        <div>
+          <div id="chatTitle">Select a friend</div>
+        </div>
+        <div id="onlineStatus"></div>
+      </div>
+
+      <div id="messagesContainer">
+        <div id="messagesList"></div>
+      </div>
+
+      <button id="loadMoreBtn" style="display: none">Load More Messages</button>
+
+      <div id="typingIndicator"></div>
+
+      <div id="inputArea">
+        <div id="replyingTo"></div>
+        <input type="text" id="messageInput" placeholder="Type message..." />
+        <div id="inputButtons">
+          <button id="sendBtn">Send</button>
+          <button id="cancelReplyBtn" style="display: none">
+            Cancel Reply
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="actionsPanel">
+      <h3>Selected Message</h3>
+      <div class="info-box" id="selectedInfo">Click a message to select</div>
+
+      <button id="replyBtn" disabled>Reply to Message</button>
+      <button id="editBtn" disabled>Edit Message</button>
+      <button id="unsendBtn" disabled>Unsend Message</button>
+      <button id="forwardBtn" disabled>Forward Message</button>
+
+      <h3>Reactions</h3>
+      <button onclick="addReaction(1)" id="react1">Thumbs Up</button>
+      <button onclick="addReaction(2)" id="react2">Heart</button>
+      <button onclick="addReaction(3)" id="react3">Laugh</button>
+      <button onclick="addReaction(4)" id="react4">Wow</button>
+      <button onclick="addReaction(5)" id="react5">Sad</button>
+      <button onclick="addReaction(6)" id="react6">Angry</button>
+      <button id="removeReactionBtn">Remove My Reaction</button>
+
+      <h3>Conversation Actions</h3>
+      <button id="markReadBtn" disabled>Mark as Read</button>
+      <button id="getReadStatusBtn" disabled>Get Read Status</button>
+
+      <div class="info-box" id="readStatusInfo">
+        Read status will appear here
+      </div>
+
+      <div id="subscriptionErrors"></div>
+    </div>
+
+    <div id="modalOverlay"></div>
+    <div id="forwardModal">
+      <h3>Forward to Conversation</h3>
+      <div id="forwardList"></div>
+      <button onclick="closeForwardModal()">Cancel</button>
+    </div>
+
+    <script>
+      const GRAPHQL_URL = "http://localhost:4000/graphql";
+      const WS_URL = "ws://localhost:4000/graphql";
+
+      let currentConversationId = null;
+      let currentFriendId = null;
+      let currentFriendUsername = null;
+      let selectedMessageId = null;
+      let selectedMessage = null;
+      let replyingToMessage = null;
+      let ws = null;
+      let subscriptionId = 1;
+      let endCursor = null;
+      let hasNextPage = false;
+      let allFriends = [];
+      let allConversations = new Map();
+      let myUserId = null;
+      let typingTimeout = null;
+      let isLoadingMore = false;
+
+      async function graphql(query, variables = {}) {
+        const response = await fetch(GRAPHQL_URL, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, variables }),
+        });
+        const result = await response.json();
+        if (result.errors) {
+          alert("Error: " + result.errors[0].message);
+          throw new Error(result.errors[0].message);
+        }
+        return result.data;
+      }
+
+      async function loadMe() {
+        const data = await graphql(`
+          query {
+            me {
+              user {
+                id
+                username
+              }
+            }
+          }
+        `);
+        myUserId = data.me.user.id;
+      }
+
+      async function loadFriends() {
+        const data = await graphql(`
+          query {
+            myFriends {
+              friends {
+                friendId
+                friend {
+                  id
+                  username
+                }
+              }
+            }
+          }
+        `);
+
+        allFriends = data.myFriends.friends;
+        const friendsList = document.getElementById("friendsList");
+        friendsList.innerHTML = "";
+
+        for (const f of allFriends) {
+          const div = document.createElement("div");
+          div.className = "friend";
+          div.textContent = f.friend.username;
+          div.onclick = () => openChat(f.friend.id, f.friend.username);
+          friendsList.appendChild(div);
+
+          checkOnlineStatus(f.friend.id, div);
+        }
+      }
+
+      async function checkOnlineStatus(userId, element) {
+        try {
+          const data = await graphql(`  
+          query { getLastOnline(userId: "${userId}") { isOnline lastOnline } }  
+        `);
+          if (data.getLastOnline.isOnline) {
+            element.classList.add("online");
+          }
+        } catch (e) {}
+      }
+
+      async function openChat(friendId, username) {
+        currentFriendId = friendId;
+        currentFriendUsername = username;
+        document.getElementById("chatTitle").textContent =
+          `Chat with ${username}`;
+        document.getElementById("messagesList").innerHTML = "";
+        selectedMessageId = null;
+        selectedMessage = null;
+        updateSelectedInfo();
+
+        const data = await graphql(`  
+        mutation { createConversation(participantId: "${friendId}") { id } }  
+      `);
+        currentConversationId = data.createConversation.id;
+        allConversations.set(friendId, currentConversationId);
+
+        document.getElementById("markReadBtn").disabled = false;
+        document.getElementById("getReadStatusBtn").disabled = false;
+
+        await loadMessages();
+
+        setupScrollListener();
+
+        setupWebSocket();
+
+        await updateOnlineStatus();
+
+        await markAsRead();
+
+        setInterval(updateLastOnline, 120000);
+      }
+
+      function setupScrollListener() {
+        const container = document.getElementById("messagesContainer");
+
+        container.addEventListener("scroll", async () => {
+          const scrollTop = container.scrollTop;
+          const scrollHeight = container.scrollHeight;
+          const clientHeight = container.clientHeight;
+
+          const isNearTop =
+            Math.abs(scrollTop) >= scrollHeight - clientHeight - 100;
+
+          if (isNearTop && hasNextPage && !isLoadingMore) {
+            isLoadingMore = true;
+
+            const oldScrollHeight = container.scrollHeight;
+
+            await loadMessages(endCursor);
+
+            setTimeout(() => {
+              const newScrollHeight = container.scrollHeight;
+              const scrollDiff = newScrollHeight - oldScrollHeight;
+              container.scrollTop = scrollTop - scrollDiff;
+              isLoadingMore = false;
+            }, 100);
+          }
+        });
+      }
+
+      async function loadMessages(cursor = null) {
+        const data = await graphql(`  
+        query {  
+          fetchMessages(conversationId: "${currentConversationId}", cursor: ${cursor ? '"' + cursor + '"' : "null"}, limit: 20) {  
+            edges {  
+              cursor  
+              node {  
+                id  
+                conversationId  
+                senderId  
+                recipientId  
+                content  
+                timeSent  
+                meta {  
+                  isUnsent  
+                  isForwarded  
+                  replyTo  
+                  lastEditAt  
+                }  
+                reactions {  
+                  userId  
+                  type  
+                }  
+                repliedMessage {  
+                  id  
+                  content  
+                  senderId  
+                }  
+              }  
+            }  
+            pageInfo {  
+              hasNextPage  
+              endCursor  
+            }  
+          }  
+        }  
+      `);
+
+        endCursor = data.fetchMessages.pageInfo.endCursor;
+        hasNextPage = data.fetchMessages.pageInfo.hasNextPage;
+
+        const messages = data.fetchMessages.edges.map((e) => e.node);
+
+        if (cursor) {
+          messages.reverse().forEach((msg) => {
+            prependMessage(msg);
+          });
+        } else {
+          messages.reverse().forEach((msg) => {
+            displayMessage(msg);
+          });
+        }
+      }
+
+      function displayMessage(msg) {
+        const messagesList = document.getElementById("messagesList");
+        const div = createMessageElement(msg);
+        messagesList.appendChild(div);
+      }
+
+      function prependMessage(msg) {
+        const messagesList = document.getElementById("messagesList");
+        const div = createMessageElement(msg);
+        messagesList.insertBefore(div, messagesList.firstChild);
+      }
+
+      function createMessageElement(msg) {
+        const div = document.createElement("div");
+        div.className = "message";
+        div.id = "msg-" + msg.id;
+        div.onclick = () => selectMessage(msg);
+
+        if (msg.meta.isUnsent) div.classList.add("unsent");
+        if (msg.meta.lastEditAt) div.classList.add("edited");
+        if (msg.meta.isForwarded) div.classList.add("forwarded");
+
+        const time = new Date(msg.timeSent).toLocaleTimeString();
+        const sender = msg.senderId === myUserId ? "Me" : "Friend";
+
+        let html = `<div class="message-header">  
+        <span>${sender} (${msg.senderId})</span>  
+        <span>${time}</span>  
+      </div>`;
+
+        if (msg.meta.replyTo && msg.repliedMessage) {
+          const replyContent = msg.repliedMessage.content || "[unsent]";
+          html += `<div class="reply-preview">Reply to: ${replyContent.substring(0, 50)}</div>`;
+        }
+
+        const content = msg.content || "[Message unsent]";
+        html += `<div class="message-content">${escapeHtml(content)}</div>`;
+
+        if (msg.reactions.length > 0) {
+          const reactionEmojis = ["", "👍", "❤️", "😂", "😮", "😢", "😡"];
+          html += '<div class="reactions">';
+          const reactionCounts = {};
+          msg.reactions.forEach((r) => {
+            const key = r.type;
+            reactionCounts[key] = (reactionCounts[key] || 0) + 1;
+          });
+          Object.entries(reactionCounts).forEach(([type, count]) => {
+            html += `<span class="reaction">${reactionEmojis[type]} ${count}</span>`;
+          });
+          html += "</div>";
+        }
+
+        const metaInfo = [];
+        if (msg.meta.isForwarded) metaInfo.push("Forwarded");
+        if (msg.meta.lastEditAt)
+          metaInfo.push(
+            `Edited at ${new Date(msg.meta.lastEditAt).toLocaleTimeString()}`,
+          );
+        if (metaInfo.length > 0) {
+          html += `<div class="message-meta">${metaInfo.join(" • ")}</div>`;
+        }
+
+        div.innerHTML = html;
+        return div;
+      }
+
+      function escapeHtml(text) {
+        const div = document.createElement("div");
+        div.textContent = text;
+        return div.innerHTML;
+      }
+
+      function selectMessage(msg) {
+        selectedMessageId = msg.id;
+        selectedMessage = msg;
+
+        document
+          .querySelectorAll(".message")
+          .forEach((el) => el.classList.remove("selected"));
+        document.getElementById("msg-" + msg.id).classList.add("selected");
+
+        updateSelectedInfo();
+
+        const isMine = msg.senderId === myUserId;
+        const isUnsent = msg.meta.isUnsent;
+
+        document.getElementById("replyBtn").disabled = isUnsent;
+        document.getElementById("editBtn").disabled = !isMine || isUnsent;
+        document.getElementById("unsendBtn").disabled = !isMine || isUnsent;
+        document.getElementById("forwardBtn").disabled = isUnsent;
+      }
+
+      function updateSelectedInfo() {
+        const info = document.getElementById("selectedInfo");
+        if (!selectedMessage) {
+          info.textContent = "Click a message to select";
+          return;
+        }
+
+        const isMine = selectedMessage.senderId === myUserId;
+        info.innerHTML = `  
+        <strong>ID:</strong> ${selectedMessage.id}<br>  
+        <strong>Sender:</strong> ${isMine ? "Me" : "Friend"}<br>  
+        <strong>Content:</strong> ${(selectedMessage.content || "[unsent]").substring(0, 50)}<br>  
+        <strong>Unsent:</strong> ${selectedMessage.meta.isUnsent}<br>  
+        <strong>Edited:</strong> ${selectedMessage.meta.lastEditAt ? "Yes" : "No"}<br>  
+        <strong>Forwarded:</strong> ${selectedMessage.meta.isForwarded}<br>  
+        <strong>Reactions:</strong> ${selectedMessage.reactions.length}  
+      `;
+      }
+
+      async function sendMessage() {
+        const input = document.getElementById("messageInput");
+        const content = input.value.trim();
+        if (!content || !currentConversationId) return;
+
+        const escapedContent = content
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"')
+          .replace(/\n/g, "\\n");
+
+        try {
+          input.value = "";
+
+          clearTimeout(typingTimeout);
+          await setTyping(false);
+
+          if (replyingToMessage) {
+            await graphql(`  
+            mutation {  
+              replyToMessage(  
+                conversationId: "${currentConversationId}",  
+                replyToMessageId: "${replyingToMessage.id}",  
+                content: "${escapedContent}"  
+              ) { id }  
+            }  
+          `);
+            cancelReply();
+          } else {
+            await graphql(`  
+            mutation {  
+              sendMessage(conversationId: "${currentConversationId}", content: "${escapedContent}") {  
+                id  
+              }  
+            }  
+          `);
+          }
+        } catch (e) {}
+      }
+
+      function startReply() {
+        if (!selectedMessage) return;
+        replyingToMessage = selectedMessage;
+        const replyDiv = document.getElementById("replyingTo");
+        replyDiv.textContent = `Replying to: ${(selectedMessage.content || "[unsent]").substring(0, 50)}`;
+        replyDiv.style.display = "block";
+        document.getElementById("cancelReplyBtn").style.display =
+          "inline-block";
+        document.getElementById("messageInput").focus();
+      }
+
+      function cancelReply() {
+        replyingToMessage = null;
+        document.getElementById("replyingTo").style.display = "none";
+        document.getElementById("cancelReplyBtn").style.display = "none";
+      }
+
+      async function editMessage() {
+        if (!selectedMessage) return;
+        const newContent = prompt("Edit message:", selectedMessage.content);
+        if (!newContent) return;
+
+        const escaped = newContent
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"')
+          .replace(/\n/g, "\\n");
+        await graphql(`  
+        mutation {  
+          editMessage(messageId: "${selectedMessage.id}", newContent: "${escaped}") {  
+            id  
+          }  
+        }  
+      `);
+      }
+
+      async function unsendMessage() {
+        if (!selectedMessage) return;
+        if (!confirm("Unsend this message?")) return;
+
+        await graphql(`  
+        mutation {  
+          unsendMessage(messageId: "${selectedMessage.id}") {  
+            id  
+          }  
+        }  
+      `);
+      }
+
+      function openForwardModal() {
+        if (!selectedMessage) return;
+
+        const forwardList = document.getElementById("forwardList");
+        forwardList.innerHTML = "";
+
+        allFriends.forEach((f) => {
+          if (f.friend.id === currentFriendId) return;
+
+          const btn = document.createElement("button");
+          btn.textContent = `Forward to ${f.friend.username}`;
+          btn.style.width = "100%";
+          btn.style.margin = "5px 0";
+          btn.onclick = async () => {
+            await forwardToFriend(f.friend.id);
+            closeForwardModal();
+          };
+          forwardList.appendChild(btn);
+        });
+
+        document.getElementById("modalOverlay").classList.add("show");
+        document.getElementById("forwardModal").classList.add("show");
+      }
+
+      function closeForwardModal() {
+        document.getElementById("modalOverlay").classList.remove("show");
+        document.getElementById("forwardModal").classList.remove("show");
+      }
+
+      async function forwardToFriend(friendId) {
+        const convData = await graphql(`  
+        mutation { createConversation(participantId: "${friendId}") { id } }  
+      `);
+        const targetConvId = convData.createConversation.id;
+
+        await graphql(`  
+        mutation {  
+          forwardMessage(messageId: "${selectedMessage.id}", toConversationId: "${targetConvId}") {  
+            id  
+          }  
+        }  
+      `);
+
+        alert("Message forwarded!");
+      }
+
+      async function addReaction(type) {
+        if (!selectedMessage) {
+          alert("Please select a message first!");
+          return;
+        }
+
+        const reactionEmojis = ["", "👍", "❤️", "😂", "😮", "😢", "😡"];
+
+        try {
+          await graphql(`  
+          mutation {  
+            addReaction(messageId: "${selectedMessage.id}", reactionType: ${type}) {  
+              id  
+            }  
+          }  
+        `);
+        } catch (e) {}
+      }
+
+      async function removeReaction() {
+        if (!selectedMessage) {
+          alert("Please select a message first!");
+          return;
+        }
+
+        try {
+          await graphql(`  
+          mutation {  
+            removeReaction(messageId: "${selectedMessage.id}") {  
+              id  
+            }  
+          }  
+        `);
+        } catch (e) {}
+      }
+
+      async function markAsRead() {
+        if (!currentConversationId) return;
+
+        await graphql(`  
+        mutation {  
+          markAsRead(conversationId: "${currentConversationId}") {  
+            conversationId  
+          }  
+        }  
+      `);
+      }
+
+      async function getReadStatus() {
+        if (!currentConversationId) return;
+
+        const data = await graphql(`  
+        query {  
+          getReadStatus(conversationId: "${currentConversationId}") {  
+            conversationId  
+            status  
+          }  
+        }  
+      `);
+
+        const info = document.getElementById("readStatusInfo");
+        const status = data.getReadStatus.status;
+        let html = "<strong>Read Status:</strong><br>";
+        Object.entries(status).forEach(([userId, timestamp]) => {
+          const time = new Date(timestamp).toLocaleString();
+          const label = userId === myUserId ? "Me" : "Friend";
+          html += `${label}: ${time}<br>`;
+        });
+        info.innerHTML = html;
+      }
+
+      async function setTyping(isTyping) {
+        if (!currentConversationId) return;
+
+        await graphql(`  
+        mutation {  
+          setTyping(conversationId: "${currentConversationId}", isTyping: ${isTyping})  
+        }  
+      `);
+      }
+
+      async function updateOnlineStatus() {
+        if (!currentFriendId) return;
+
+        try {
+          const data = await graphql(`  
+          query { getLastOnline(userId: "${currentFriendId}") { isOnline lastOnline } }  
+        `);
+
+          const statusDiv = document.getElementById("onlineStatus");
+          if (data.getLastOnline.isOnline) {
+            statusDiv.textContent = "🟢 Online";
+            statusDiv.style.color = "green";
+          } else {
+            const lastSeen = new Date(
+              data.getLastOnline.lastOnline,
+            ).toLocaleString();
+            statusDiv.textContent = `🔴 Last seen: ${lastSeen}`;
+            statusDiv.style.color = "gray";
+          }
+        } catch (e) {}
+      }
+
+      async function updateLastOnline() {
+        try {
+          await graphql(`
+            mutation {
+              updateLastOnline {
+                id
+              }
+            }
+          `);
+        } catch (e) {}
+      }
+
+      function setupWebSocket() {
+        if (ws) ws.close();
+
+        ws = new WebSocket(WS_URL, "graphql-transport-ws");
+
+        ws.onopen = () => {
+          ws.send(JSON.stringify({ type: "connection_init" }));
+        };
+
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+
+          if (msg.type === "connection_ack") {
+            subscribeToMessages();
+            subscribeToMessageUpdates();
+            subscribeToReactions();
+            subscribeToReadStatus();
+            subscribeToTyping();
+          }
+
+          if (msg.type === "next") {
+            if (msg.payload && msg.payload.errors) {
+              displaySubscriptionError(msg.payload.errors);
+              return;
+            }
+
+            if (msg.payload && msg.payload.data) {
+              handleSubscriptionData(msg.payload.data);
+            } else {
+            }
+          }
+
+          if (msg.type === "error") {
+            displaySubscriptionError([msg.payload]);
+          }
+        };
+
+        ws.onerror = (err) => {};
+        ws.onclose = () => {};
+      }
+
+      function displaySubscriptionError(errors) {
+        const errorsDiv = document.getElementById("subscriptionErrors");
+        errors.forEach((err) => {
+          const errorBox = document.createElement("div");
+          errorBox.className = "error-box";
+          errorBox.innerHTML = `  
+          <strong>Subscription Error:</strong><br>  
+          ${err.message || JSON.stringify(err)}  
+        `;
+          errorsDiv.appendChild(errorBox);
+
+          setTimeout(() => errorBox.remove(), 10000);
+        });
+      }
+
+      function subscribe(query) {
+        const id = String(subscriptionId++);
+        ws.send(
+          JSON.stringify({
+            id,
+            type: "subscribe",
+            payload: { query },
+          }),
+        );
+      }
+
+      function subscribeToMessages() {
+        subscribe(`  
+        subscription {  
+          messageReceived(conversationId: "${currentConversationId}") {  
+            id conversationId senderId recipientId content timeSent  
+            meta { isUnsent isForwarded replyTo lastEditAt }  
+            reactions { userId type }  
+            repliedMessage { id content senderId }  
+          }  
+        }  
+      `);
+      }
+
+      function subscribeToMessageUpdates() {
+        subscribe(`  
+        subscription {  
+          messageUpdated(conversationId: "${currentConversationId}") {  
+            id content  
+            meta { isUnsent lastEditAt }  
+          }  
+        }  
+      `);
+      }
+
+      function subscribeToReactions() {
+        subscribe(`  
+        subscription {  
+          reactionUpdated(conversationId: "${currentConversationId}") {  
+            messageId  
+          }  
+        }  
+      `);
+      }
+
+      function subscribeToReadStatus() {
+        subscribe(`  
+        subscription {  
+          readStatusChanged(conversationId: "${currentConversationId}") {  
+            conversationId userId timestamp  
+          }  
+        }  
+      `);
+      }
+
+      function subscribeToTyping() {
+        subscribe(`  
+        subscription {  
+          typingIndicator(conversationId: "${currentConversationId}") {  
+            conversationId userId isTyping  
+          }  
+        }  
+      `);
+      }
+
+      function handleSubscriptionData(data) {
+        if (data.messageReceived) {
+          displayMessage(data.messageReceived);
+          document.getElementById("messagesContainer").scrollTop =
+            document.getElementById("messagesContainer").scrollHeight;
+        }
+
+        if (data.messageUpdated) {
+          updateMessageInUI(data.messageUpdated);
+        }
+
+        if (data.reactionUpdated) {
+          graphql(`  
+          query {  
+            fetchMessages(conversationId: "${currentConversationId}", limit: 100) {  
+              edges {  
+                node {  
+                  id  
+                  reactions { userId type }  
+                }  
+              }  
+            }  
+          }  
+        `)
+            .then((result) => {
+              const msg = result.fetchMessages.edges.find(
+                (e) => e.node.id === data.reactionUpdated.messageId,
+              );
+              if (msg) {
+                updateReactionsInUI({
+                  messageId: msg.node.id,
+                  reactions: msg.node.reactions,
+                });
+              }
+            })
+            .catch((error) => {});
+        }
+
+        if (data.readStatusChanged) {
+          if (data.readStatusChanged.userId !== myUserId) {
+          }
+        }
+
+        if (data.typingIndicator) {
+          if (data.typingIndicator.userId !== myUserId) {
+            const indicator = document.getElementById("typingIndicator");
+            if (data.typingIndicator.isTyping) {
+              indicator.textContent = `${currentFriendUsername} is typing...`;
+            } else {
+              indicator.textContent = "";
+            }
+          }
+        }
+      }
+
+      function updateMessageInUI(msg) {
+        const element = document.getElementById("msg-" + msg.id);
+        if (!element) {
+          return;
+        }
+
+        let updatedMessage =
+          selectedMessage && selectedMessage.id === msg.id
+            ? { ...selectedMessage, ...msg }
+            : { ...msg, reactions: [] };
+
+        const parent = element.parentNode;
+        if (parent) {
+          parent.removeChild(element);
+          const newElement = createMessageElement(updatedMessage);
+          parent.insertBefore(newElement, element.nextSibling);
+        }
+
+        if (selectedMessageId === msg.id) {
+          selectedMessage = updatedMessage;
+          updateSelectedInfo();
+        }
+      }
+
+      function updateReactionsInUI(data) {
+        const element = document.getElementById("msg-" + data.messageId);
+        if (!element) {
+          return;
+        }
+
+        let reactionsDiv = element.querySelector(".reactions");
+        if (!reactionsDiv && data.reactions.length > 0) {
+          reactionsDiv = document.createElement("div");
+          reactionsDiv.className = "reactions";
+          const contentDiv = element.querySelector(".message-content");
+          if (contentDiv) {
+            if (contentDiv.nextSibling) {
+              contentDiv.parentNode.insertBefore(
+                reactionsDiv,
+                contentDiv.nextSibling,
+              );
+            } else {
+              contentDiv.parentNode.appendChild(reactionsDiv);
+            }
+          }
+        }
+
+        const reactionEmojis = ["", "👍", "❤️", "😂", "😮", "😢", "😡"];
+
+        if (reactionsDiv) {
+          reactionsDiv.innerHTML = "";
+
+          if (data.reactions.length > 0) {
+            const reactionCounts = {};
+            data.reactions.forEach((r) => {
+              reactionCounts[r.type] = (reactionCounts[r.type] || 0) + 1;
+            });
+            Object.entries(reactionCounts).forEach(([type, count]) => {
+              const span = document.createElement("span");
+              span.className = "reaction";
+              span.textContent = `${reactionEmojis[type]} ${count}`;
+              reactionsDiv.appendChild(span);
+            });
+          } else {
+            reactionsDiv.remove();
+          }
+        }
+
+        if (selectedMessageId === data.messageId) {
+          if (selectedMessage) {
+            selectedMessage.reactions = data.reactions;
+            updateSelectedInfo();
+          }
+        }
+      }
+
+      document.getElementById("sendBtn").onclick = sendMessage;
+      document.getElementById("messageInput").onkeypress = (e) => {
+        if (e.key === "Enter") {
+          sendMessage();
+        }
+      };
+
+      document.getElementById("messageInput").oninput = async () => {
+        if (!currentConversationId) return;
+
+        clearTimeout(typingTimeout);
+
+        const hasContent =
+          document.getElementById("messageInput").value.trim().length > 0;
+
+        if (hasContent) {
+          await setTyping(true);
+
+          typingTimeout = setTimeout(async () => {
+            await setTyping(false);
+          }, 3000);
+        } else {
+          await setTyping(false);
+        }
+      };
+
+      document.getElementById("replyBtn").onclick = startReply;
+      document.getElementById("cancelReplyBtn").onclick = cancelReply;
+      document.getElementById("editBtn").onclick = editMessage;
+      document.getElementById("unsendBtn").onclick = unsendMessage;
+      document.getElementById("forwardBtn").onclick = openForwardModal;
+      document.getElementById("removeReactionBtn").onclick = removeReaction;
+      document.getElementById("markReadBtn").onclick = markAsRead;
+      document.getElementById("getReadStatusBtn").onclick = getReadStatus;
+
+      (async () => {
+        await loadMe();
+        await loadFriends();
+        await updateLastOnline();
+      })();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,5354 @@
+# GraphQL API Documentation for Real-Time Communication Platform  
+
+## Background Context and Documentation Purpose  
+
+This documentation serves as the comprehensive integration guide for frontend developers building against a real-time communication backend powered by GraphQL. The system implements a complete social messaging platform with four interconnected core systems: user authentication with session management, bidirectional friend relationships, feature-rich messaging with advanced capabilities (replies, reactions, editing, forwarding), and WebRTC-based audio/video calling with full signaling support.  
+
+### Architectural Context  
+
+The backend employs a hybrid architecture combining PostgreSQL for relational user and friendship data, MongoDB for document-based conversations and messages, and Redis for session storage, call state management, and rate limiting. The GraphQL layer unifies these data sources through a single endpoint for queries/mutations and a WebSocket endpoint for real-time subscriptions using the `graphql-transport-ws` protocol.  
+
+### Authentication Model  
+
+The API uses **session-based authentication** with HTTP-only cookies (`connect.sid`), stored in Redis with configurable TTL (default 7 days). All requests requiring authentication must include `credentials: 'include'` in fetch options to ensure cookies are sent cross-origin. Subscriptions authenticate via the same cookie mechanism during WebSocket handshake. There is no JWT or token-based authentication—session cookies are the sole authentication mechanism.  
+
+### Data Consistency Patterns  
+
+The system maintains eventual consistency between SQL and NoSQL stores. Friend relationships stored in PostgreSQL gate access to messaging features in MongoDB. Conversation participants are validated against friendship status. Call state lives temporarily in Redis (2-hour TTL) and persists to MongoDB only upon call completion/rejection/miss as message metadata.  
+
+### Custom Scalar Types  
+
+- **DateTime**: ISO 8601 string format (`2024-01-15T10:30:00.000Z`). All timestamps serialize to this format. When parsing, the scalar accepts ISO strings and converts them to Date objects internally.  
+- **JSON**: Arbitrary JSON objects/arrays. Used for SDP payloads, ICE candidates, and read status maps. No schema validation—accepts any valid JSON structure.  
+
+### Error Code Taxonomy  
+
+GraphQL errors follow a standardized `extensions.code` pattern:  
+
+- **UNAUTHENTICATED**: No valid session exists (req.session.userId is null/undefined). Returned when accessing protected resolvers without login.  
+- **FORBIDDEN**: Authenticated but lacking permission (e.g., trying to accept someone else's friend request, accessing conversations you're not participant in).  
+- **BAD_REQUEST**: Input validation failure (malformed IDs, empty content, invalid cursor format, out-of-range reaction types).  
+- **NOT_FOUND**: Resource doesn't exist in database (conversation, message, friend request, call not found).  
+- **INTERNAL_SERVER_ERROR**: Unexpected server failure (database connection issues, Redis unavailability). In production, error messages are sanitized.  
+
+### Subscription Architecture  
+
+All subscriptions use PubSub (GraphQL Subscriptions library) with in-memory event emitters. When multiple backend instances run (horizontally scaled), a shared Redis PubSub adapter would be required (not currently implemented—single-instance assumption). Subscriptions filter events server-side using `withFilter` to ensure users only receive events they're authorized to see.  
+
+---  
+
+## Table of Contents  
+
+1. [Overview](#1-overview)  
+2. [Authentication System](#2-authentication-system)  
+3. [Friend Management System](#3-friend-management-system)  
+4. [Messaging System](#4-messaging-system)  
+5. [WebRTC Calling System](#5-webrtc-calling-system)  
+6. [Subscription Connection Guide](#6-subscription-connection-guide)  
+7. [Type Reference](#7-type-reference)  
+8. [Error Handling Guide](#8-error-handling-guide)  
+9. [Complete Feature Checklist](#9-complete-feature-checklist)  
+
+---  
+
+## 1. Overview  
+
+### Endpoints  
+
+- **GraphQL HTTP Endpoint**: `http://localhost:4000/graphql` (queries and mutations)  
+- **GraphQL WebSocket Endpoint**: `ws://localhost:4000/graphql` (subscriptions)  
+- **Protocol**: `graphql-transport-ws` (graphql-ws library compatible)  
+
+### Authentication Mechanism  
+
+Session-based authentication using HTTP-only cookies. The server sets a `connect.sid` cookie upon successful login, stored in Redis with default 7-day expiration (configurable via `SESSION_MAX_AGE` environment variable).  
+
+**Required HTTP Headers for All Requests:**  
+
+```javascript  
+fetch('http://localhost:4000/graphql', {  
+  method: 'POST',  
+  credentials: 'include', // CRITICAL: Ensures cookies are sent  
+  headers: {  
+    'Content-Type': 'application/json'  
+  },  
+  body: JSON.stringify({ query, variables })  
+})  
+```  
+
+**Cookie Behavior:**  
+- **Set on**: Successful `login` mutation  
+- **Cleared on**: `logout` mutation  
+- **Validated on**: Every authenticated resolver checks `req.session.userId`  
+- **WebSocket Auth**: Cookie parsed from `Sec-WebSocket-Protocol` handshake headers  
+
+### Custom Scalar Types  
+
+#### DateTime  
+
+**Serialization**: JavaScript `Date` objects serialize to ISO 8601 strings.  
+
+```json  
+{  
+  "timeSent": "2024-01-15T14:30:00.000Z"  
+}  
+```  
+
+**Parsing**: Accepts ISO 8601 strings. Frontend should pass timestamps as strings in queries/mutations.  
+
+#### JSON  
+
+**Format**: Any valid JSON value (object, array, string, number, boolean, null).  
+
+**Usage Examples:**  
+- SDP offers/answers: `{ type: "offer", sdp: "v=0\r\no=..." }`  
+- ICE candidates: `{ candidate: "candidate:1 1 UDP...", sdpMLineIndex: 0 }`  
+- Read status maps: `{ "user123": "2024-01-15T10:00:00Z", "user456": "2024-01-15T10:05:00Z" }`  
+
+### Error Code Taxonomy  
+
+| Code | Meaning | Common Causes |  
+|------|---------|---------------|  
+| `UNAUTHENTICATED` | No valid session | Accessing protected resolver without login, session expired |  
+| `FORBIDDEN` | Insufficient permissions | Accepting others' friend requests, accessing non-participant conversations |  
+| `BAD_REQUEST` | Invalid input | Empty message content, invalid ObjectId format, cursor parse failure |  
+| `NOT_FOUND` | Resource doesn't exist | Message/conversation/call not found in database |  
+| `INTERNAL_SERVER_ERROR` | Server error | Database connection failure, Redis unavailable |  
+
+---  
+
+## 2. Authentication System  
+
+All authentication mutations are **public** (no session required). Queries like `me` require authentication.  
+
+### Registration  
+
+**Signature:**  
+```graphql  
+mutation Register($username: String!, $password: String!): AuthResponse!  
+```  
+
+**Input Validation Rules:**  
+- **Username**:   
+  - Minimum 3 characters  
+  - Alphanumeric + underscore only (`/^[a-zA-Z0-9_]+$/`)  
+  - Trimmed of whitespace  
+- **Password**:   
+  - Minimum 8 characters  
+  - No character restrictions (hashed with bcrypt)  
+
+**Success Response Structure:**  
+```typescript  
+{  
+  success: boolean  
+  message: string  
+  user: {  
+    id: string  
+    username: string  
+  } | null  
+}  
+```  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  register(username: "alice_smith", password: "SecurePass123") {  
+    success  
+    message  
+    user {  
+      id  
+      username  
+    }  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "register": {  
+      "success": true,  
+      "message": "Registration successful! Please log in.",  
+      "user": {  
+        "id": "123",  
+        "username": "alice_smith"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Username too short:**  
+```json  
+{  
+  "data": {  
+    "register": {  
+      "success": false,  
+      "message": "Username must be at least 3 characters",  
+      "user": null  
+    }  
+  }  
+}  
+```  
+
+2. **Invalid characters:**  
+```json  
+{  
+  "data": {  
+    "register": {  
+      "success": false,  
+      "message": "Username can only contain letters, numbers, and underscores",  
+      "user": null  
+    }  
+  }  
+}  
+```  
+
+3. **Duplicate username:**  
+```json  
+{  
+  "data": {  
+    "register": {  
+      "success": false,  
+      "message": "Username already exists",  
+      "user": null  
+    }  
+  }  
+}  
+```  
+
+---  
+
+### Login  
+
+**Signature:**  
+```graphql  
+mutation Login($username: String!, $password: String!): AuthResponse!  
+```  
+
+**Session Creation Behavior:**  
+1. Validates credentials against PostgreSQL `users` table  
+2. Regenerates session ID (security best practice)  
+3. Sets `req.session.userId` to authenticated user ID  
+4. Saves session to Redis with TTL  
+5. Sets `connect.sid` HTTP-only cookie in response  
+
+**Cookie Handling Requirements:**  
+- Frontend **must** include `credentials: 'include'` in all subsequent requests  
+- Cookie persists across browser sessions (unless cleared)  
+- Cookie path: `/` (available to all routes)  
+- `sameSite: 'lax'` (allows cross-site GET requests, prevents CSRF on POST)  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  login(username: "alice_smith", password: "SecurePass123") {  
+    success  
+    message  
+    user {  
+      id  
+      username  
+    }  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "login": {  
+      "success": true,  
+      "message": "Login successful",  
+      "user": {  
+        "id": "123",  
+        "username": "alice_smith"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Response (Invalid Credentials):**  
+```json  
+{  
+  "data": {  
+    "login": {  
+      "success": false,  
+      "message": "Invalid credentials",  
+      "user": null  
+    }  
+  }  
+}  
+```  
+
+**Post-Login Requirements:**  
+After successful login, the frontend should:  
+1. Store user data in application state  
+2. Redirect to main application view  
+3. Establish WebSocket connection for subscriptions (uses same cookie)  
+
+---  
+
+### Logout  
+
+**Signature:**  
+```graphql  
+mutation Logout: LogoutResponse!  
+```  
+
+**Session Destruction Behavior:**  
+1. Destroys session in Redis (via `req.session.destroy()`)  
+2. Clears `connect.sid` cookie with `res.clearCookie()`  
+3. Returns success even if no session existed (idempotent)  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  logout {  
+    success  
+    message  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "logout": {  
+      "success": true,  
+      "message": "Logged out successfully"  
+    }  
+  }  
+}  
+```  
+
+**Post-Logout Actions:**  
+Frontend should:  
+1. Clear application state (user data, messages, etc.)  
+2. Close WebSocket connection  
+3. Redirect to login page  
+
+---  
+
+### Current User Query  
+
+**Signature:**  
+```graphql  
+query Me: ProtectedDataResponse!  
+```  
+
+**Authentication Requirement:** **Required** (throws `UNAUTHENTICATED` if no session)  
+
+**Returns:**  
+- User ID and username from session  
+- Timestamp of query execution  
+- Welcome message  
+
+**Example Request:**  
+```graphql  
+query {  
+  me {  
+    message  
+    user {  
+      id  
+      username  
+    }  
+    timestamp  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "me": {  
+      "message": "Welcome back, alice_smith!",  
+      "user": {  
+        "id": "123",  
+        "username": "alice_smith"  
+      },  
+      "timestamp": "2024-01-15T14:30:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Error When Unauthenticated:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Not authenticated",  
+      "extensions": {  
+        "code": "UNAUTHENTICATED"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Usage Pattern:**  
+Call `me` query on app initialization to:  
+1. Verify session validity  
+2. Retrieve current user data  
+3. Handle session expiration gracefully (redirect to login on `UNAUTHENTICATED`)  
+
+---  
+
+## 3. Friend Management System  
+
+All friend operations require authentication. Friendships are **bidirectional**—when user A adds user B as friend, both can see each other in friends lists.  
+
+### Queries  
+
+#### myFriends  
+
+**Signature:**  
+```graphql  
+query MyFriends: FriendListResponse!  
+```  
+
+**Description:** Retrieves authenticated user's friends list with full user objects.  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+query {  
+  myFriends {  
+    friends {  
+      friendId  
+      createdAt  
+      friend {  
+        id  
+        username  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "myFriends": {  
+      "friends": [  
+        {  
+          "friendId": "456",  
+          "createdAt": "2024-01-10T08:30:00.000Z",  
+          "friend": {  
+            "id": "456",  
+            "username": "bob_jones"  
+          }  
+        },  
+        {  
+          "friendId": "789",  
+          "createdAt": "2024-01-12T15:20:00.000Z",  
+          "friend": {  
+            "id": "789",  
+            "username": "charlie_brown"  
+          }  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+- Returns empty array `[]` if user has no friends (not an error)  
+- Throws `UNAUTHENTICATED` if session invalid  
+
+---  
+
+#### userFriends  
+
+**Signature:**  
+```graphql  
+query UserFriends($userId: ID!): FriendListResponse!  
+```  
+
+**Description:** Retrieves another user's friends list (public operation—no friendship requirement).  
+
+**Authentication:** **Not Required** (public query)  
+
+**Example Request:**  
+```graphql  
+query {  
+  userFriends(userId: "456") {  
+    friends {  
+      friendId  
+      createdAt  
+      friend {  
+        id  
+        username  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "userFriends": {  
+      "friends": [  
+        {  
+          "friendId": "123",  
+          "createdAt": "2024-01-10T08:30:00.000Z",  
+          "friend": {  
+            "id": "123",  
+            "username": "alice_smith"  
+          }  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+**Error Response (User Not Found):**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "User not found",  
+      "extensions": {  
+        "code": "NOT_FOUND"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+---  
+
+#### checkFriendship  
+
+**Signature:**  
+```graphql  
+query CheckFriendship($userId1: ID!, $userId2: ID!): FriendshipCheckResponse!  
+```  
+
+**Description:** Verifies whether two users are friends. Returns `false` gracefully if either user doesn't exist (no error thrown).  
+
+**Authentication:** **Not Required**  
+
+**Example Request:**  
+```graphql  
+query {  
+  checkFriendship(userId1: "123", userId2: "456") {  
+    areFriends  
+    userId1  
+    userId2  
+  }  
+}  
+```  
+
+**Response (Friends):**  
+```json  
+{  
+  "data": {  
+    "checkFriendship": {  
+      "areFriends": true,  
+      "userId1": "123",  
+      "userId2": "456"  
+    }  
+  }  
+}  
+```  
+
+**Response (Not Friends):**  
+```json  
+{  
+  "data": {  
+    "checkFriendship": {  
+      "areFriends": false,  
+      "userId1": "123",  
+      "userId2": "999"  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### myFriendRequests  
+
+**Signature:**  
+```graphql  
+query MyFriendRequests: FriendRequestListResponse!  
+```  
+
+**Description:** Returns both sent and received friend requests for authenticated user.  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+query {  
+  myFriendRequests {  
+    sent {  
+      id  
+      fromUserId  
+      toUserId  
+      fromUser {  
+        id  
+        username  
+      }  
+      toUser {  
+        id  
+        username  
+      }  
+      createdAt  
+    }  
+    received {  
+      id  
+      fromUserId  
+      toUserId  
+      fromUser {  
+        id  
+        username  
+      }  
+      toUser {  
+        id  
+        username  
+      }  
+      createdAt  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "myFriendRequests": {  
+      "sent": [  
+        {  
+          "id": "req123",  
+          "fromUserId": "123",  
+          "toUserId": "999",  
+          "fromUser": {  
+            "id": "123",  
+            "username": "alice_smith"  
+          },  
+          "toUser": {  
+            "id": "999",  
+            "username": "david_clark"  
+          },  
+          "createdAt": "2024-01-14T09:00:00.000Z"  
+        }  
+      ],  
+      "received": [  
+        {  
+          "id": "req456",  
+          "fromUserId": "888",  
+          "toUserId": "123",  
+          "fromUser": {  
+            "id": "888",  
+            "username": "eve_wilson"  
+          },  
+          "toUser": {  
+            "id": "123",  
+            "username": "alice_smith"  
+          },  
+          "createdAt": "2024-01-13T16:30:00.000Z"  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+---  
+
+### Mutations  
+
+#### sendFriendRequest  
+
+**Signature:**  
+```graphql  
+mutation SendFriendRequest($toUserId: ID!): FriendRequestResponse!  
+```  
+
+**Validation Rules:**  
+1. Cannot send request to self  
+2. Target user must exist  
+3. Not already friends with target  
+4. No existing friend request between users (in either direction)  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  sendFriendRequest(toUserId: "999") {  
+    success  
+    message  
+    request {  
+      id  
+      fromUserId  
+      toUserId  
+      fromUser {  
+        id  
+        username  
+      }  
+      toUser {  
+        id  
+        username  
+      }  
+      createdAt  
+    }  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": true,  
+      "message": "Friend request sent successfully",  
+      "request": {  
+        "id": "req789",  
+        "fromUserId": "123",  
+        "toUserId": "999",  
+        "fromUser": {  
+          "id": "123",  
+          "username": "alice_smith"  
+        },  
+        "toUser": {  
+          "id": "999",  
+          "username": "david_clark"  
+        },  
+        "createdAt": "2024-01-15T14:30:00.000Z"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Sending to self:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": false,  
+      "message": "Cannot send friend request to yourself",  
+      "request": null  
+    }  
+  }  
+}  
+```  
+
+2. **User not found:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": false,  
+      "message": "Target user not found",  
+      "request": null  
+    }  
+  }  
+}  
+```  
+
+3. **Already friends:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": false,  
+      "message": "You are already friends with this user",  
+      "request": null  
+    }  
+  }  
+}  
+```  
+
+4. **Request already exists:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": false,  
+      "message": "Friend request already exists",  
+      "request": null  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### acceptFriendRequest  
+
+**Signature:**  
+```graphql  
+mutation AcceptFriendRequest($requestId: ID!): FriendActionResponse!  
+```  
+
+**Behavior:**  
+1. Validates request exists and user is the recipient  
+2. Creates **bidirectional** friendship entries in PostgreSQL  
+3. Deletes friend request from MongoDB  
+4. Both users now appear in each other's `myFriends` query  
+
+**Authorization:** Only the **recipient** (`toUserId`) can accept the request.  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  acceptFriendRequest(requestId: "req456") {  
+    success  
+    message  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "acceptFriendRequest": {  
+      "success": true,  
+      "message": "Friend request accepted successfully"  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Request not found:**  
+```json  
+{  
+  "data": {  
+    "acceptFriendRequest": {  
+      "success": false,  
+      "message": "Friend request not found"  
+    }  
+  }  
+}  
+```  
+
+2. **Not recipient (unauthorized):**  
+```json  
+{  
+  "data": {  
+    "acceptFriendRequest": {  
+      "success": false,  
+      "message": "You can only accept requests sent to you"  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### refuseFriendRequest  
+
+**Signature:**  
+```graphql  
+mutation RefuseFriendRequest($requestId: ID!): FriendActionResponse!  
+```  
+
+**Behavior:**  
+1. Validates request exists and user is the recipient  
+2. Deletes friend request from MongoDB  
+3. No friendship is created  
+
+**Authorization:** Only the **recipient** (`toUserId`) can refuse the request.  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  refuseFriendRequest(requestId: "req456") {  
+    success  
+    message  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "refuseFriendRequest": {  
+      "success": true,  
+      "message": "Friend request refused successfully"  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:** Same as `acceptFriendRequest` (not found, not recipient).  
+
+---  
+
+#### removeFriend  
+
+**Signature:**  
+```graphql  
+mutation RemoveFriend($friendId: ID!): FriendActionResponse!  
+```  
+
+**Behavior:**  
+1. Validates friendship exists  
+2. Deletes **both** friendship entries (bidirectional removal)  
+3. Users no longer appear in each other's friends lists  
+4. Existing conversations remain but may affect call permissions  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  removeFriend(friendId: "456") {  
+    success  
+    message  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "removeFriend": {  
+      "success": true,  
+      "message": "Friend removed successfully"  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Not friends:**  
+```json  
+{  
+  "data": {  
+    "removeFriend": {  
+      "success": false,  
+      "message": "You are not friends with this user"  
+    }  
+  }  
+}  
+```  
+
+2. **Invalid friend ID (self):**  
+```json  
+{  
+  "data": {  
+    "removeFriend": {  
+      "success": false,  
+      "message": "Invalid friend ID"  
+    }  
+  }  
+}  
+```  
+
+---  
+
+## 4. Messaging System  
+
+Messaging requires both authentication and conversation participation. All operations validate that the authenticated user is a participant in the target conversation.  
+
+### Queries  
+
+#### fetchMessages  
+
+**Signature:**  
+```graphql  
+query FetchMessages(  
+  $conversationId: ID!  
+  $cursor: String  
+  $limit: Int = 20  
+): MessageConnection!  
+```  
+
+**Description:** Retrieves message history with cursor-based pagination. Messages return in **descending** time order (newest first for initial load, then older messages when paginating).  
+
+**Cursor Format:** Base64-encoded ISO 8601 timestamp. Example:  
+```javascript  
+// Encoding cursor  
+const cursor = Buffer.from('2024-01-15T14:30:00.000Z').toString('base64');  
+// "MjAyNC0wMS0xNVQxNDozMDowMC4wMDBa"  
+
+// Decoding cursor (backend does this)  
+const timestamp = Buffer.from(cursor, 'base64').toString('utf-8');  
+// "2024-01-15T14:30:00.000Z"  
+```  
+
+**Pagination Parameters:**  
+- **cursor**: Timestamp cursor from previous response's `endCursor`. Omit for first page.  
+- **limit**: Number of messages to fetch. Default: 20, Max: 100 (enforced server-side).  
+
+**hasNextPage Usage:**  
+- `true`: More messages exist before `endCursor` timestamp  
+- `false`: No older messages available  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Initial Load:**  
+```graphql  
+query {  
+  fetchMessages(conversationId: "conv123", limit: 20) {  
+    edges {  
+      cursor  
+      node {  
+        id  
+        conversationId  
+        senderId  
+        recipientId  
+        content  
+        timeSent  
+        meta {  
+          isUnsent  
+          isForwarded  
+          replyTo  
+          lastEditAt  
+        }  
+        reactions {  
+          userId  
+          type  
+        }  
+        repliedMessage {  
+          id  
+          content  
+          senderId  
+        }  
+      }  
+    }  
+    pageInfo {  
+      hasNextPage  
+      endCursor  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "fetchMessages": {  
+      "edges": [  
+        {  
+          "cursor": "MjAyNC0wMS0xNVQxNDozMDowMC4wMDBa",  
+          "node": {  
+            "id": "msg123",  
+            "conversationId": "conv123",  
+            "senderId": "123",  
+            "recipientId": "456",  
+            "content": "Hey, how are you?",  
+            "timeSent": "2024-01-15T14:30:00.000Z",  
+            "meta": {  
+              "isUnsent": false,  
+              "isForwarded": false,  
+              "replyTo": null,  
+              "lastEditAt": null  
+            },  
+            "reactions": [  
+              {  
+                "userId": "456",  
+                "type": 1  
+              }  
+            ],  
+            "repliedMessage": null  
+          }  
+        }  
+      ],  
+      "pageInfo": {  
+        "hasNextPage": true,  
+        "endCursor": "MjAyNC0wMS0xNVQxNDoyMDowMC4wMDBa"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Pagination Loop Example:**  
+```graphql  
+query {  
+  fetchMessages(  
+    conversationId: "conv123"  
+    cursor: "MjAyNC0wMS0xNVQxNDoyMDowMC4wMDBa"  
+    limit: 20  
+  ) {  
+    edges {  
+      cursor  
+      node {  
+        id  
+        content  
+        timeSent  
+      }  
+    }  
+    pageInfo {  
+      hasNextPage  
+      endCursor  
+    }  
+  }  
+}  
+```  
+
+**Frontend Implementation Pattern:**  
+```javascript  
+async function loadMoreMessages(conversationId, cursor = null) {  
+  const response = await fetch('/graphql', {  
+    method: 'POST',  
+    credentials: 'include',  
+    headers: { 'Content-Type': 'application/json' },  
+    body: JSON.stringify({  
+      query: `  
+        query FetchMessages($conversationId: ID!, $cursor: String, $limit: Int) {  
+          fetchMessages(conversationId: $conversationId, cursor: $cursor, limit: $limit) {  
+            edges {  
+              cursor  
+              node { id content timeSent senderId }  
+            }  
+            pageInfo { hasNextPage endCursor }  
+          }  
+        }  
+      `,  
+      variables: { conversationId, cursor, limit: 20 }  
+    })  
+  });  
+  
+  const { data } = await response.json();  
+  const messages = data.fetchMessages.edges.map(e => e.node);  
+  const { hasNextPage, endCursor } = data.fetchMessages.pageInfo;  
+  
+  // Append messages to state  
+  // If hasNextPage is true, show "Load More" button with endCursor  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Not participant:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "You are not a participant in this conversation",  
+      "extensions": { "code": "FORBIDDEN" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Invalid cursor:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Invalid cursor format",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### getReadStatus  
+
+**Signature:**  
+```graphql  
+query GetReadStatus($conversationId: ID!): ReadStatusMap!  
+```  
+
+**Description:** Returns timestamp of when each participant last marked conversation as read.  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+query {  
+  getReadStatus(conversationId: "conv123") {  
+    conversationId  
+    status  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "getReadStatus": {  
+      "conversationId": "conv123",  
+      "status": {  
+        "123": "2024-01-15T14:30:00.000Z",  
+        "456": "2024-01-15T14:25:00.000Z"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Usage Pattern:**  
+Compare read timestamps with message `timeSent` to determine if message has been read by other participant.  
+
+---  
+
+#### getLastOnline  
+
+**Signature:**  
+```graphql  
+query GetLastOnline($userId: String!): LastOnlineStatus!  
+```  
+
+**Description:** Returns user's last online timestamp and online status (online if last update within 2 minutes).  
+
+**Authentication:** **Required**  
+**Authorization:** Must share at least one conversation with target user.  
+
+**Online Threshold:** 2 minutes (120 seconds). If `lastOnline` timestamp is within this window, `isOnline` returns `true`.  
+
+**Example Request:**  
+```graphql  
+query {  
+  getLastOnline(userId: "456") {  
+    userId  
+    lastOnline  
+    isOnline  
+  }  
+}  
+```  
+
+**Response (Online):**  
+```json  
+{  
+  "data": {  
+    "getLastOnline": {  
+      "userId": "456",  
+      "lastOnline": "2024-01-15T14:29:30.000Z",  
+      "isOnline": true  
+    }  
+  }  
+}  
+```  
+
+**Response (Offline):**  
+```json  
+{  
+  "data": {  
+    "getLastOnline": {  
+      "userId": "456",  
+      "lastOnline": "2024-01-15T12:00:00.000Z",  
+      "isOnline": false  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Not connected:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Not connected to this user",  
+      "extensions": { "code": "FORBIDDEN" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+### Mutations  
+
+#### createConversation  
+
+**Signature:**  
+```graphql  
+mutation CreateConversation($participantId: String!): Conversation!  
+```  
+
+**Description:** Creates or returns existing 1-on-1 conversation. Idempotent—safe to call multiple times with same participant.  
+
+**Behavior:**  
+- If conversation exists with sorted `[currentUserId, participantId]`, returns existing conversation  
+- Otherwise creates new conversation with empty `lastMessage` and `readStatus`  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  createConversation(participantId: "456") {  
+    id  
+    participantIds  
+    lastMessage {  
+      senderId  
+      text  
+      timeSent  
+    }  
+    readStatus  
+    createdAt  
+  }  
+}  
+```  
+
+**Response (New Conversation):**  
+```json  
+{  
+  "data": {  
+    "createConversation": {  
+      "id": "conv789",  
+      "participantIds": ["123", "456"],  
+      "lastMessage": null,  
+      "readStatus": {},  
+      "createdAt": "2024-01-15T14:30:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Cannot message self:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Cannot create conversation with yourself",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Participant not found:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Participant user not found",  
+      "extensions": { "code": "NOT_FOUND" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### sendMessage  
+
+**Signature:**  
+```graphql  
+mutation SendMessage($conversationId: ID!, $content: String!): Message!  
+```  
+
+**Content Validation:**  
+- **Trimming**: Leading/trailing whitespace removed  
+- **Min length**: 1 character (after trimming)  
+- **Max length**: 5000 characters (after trimming)  
+
+**Side Effects:**  
+1. Creates message in MongoDB  
+2. Updates conversation `lastMessage` preview  
+3. Triggers `messageReceived` subscription for other participant  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  sendMessage(conversationId: "conv123", content: "Hello there!") {  
+    id  
+    conversationId  
+    senderId  
+    recipientId  
+    content  
+    timeSent  
+    meta {  
+      isUnsent  
+      isForwarded  
+      replyTo  
+      lastEditAt  
+    }  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "sendMessage": {  
+      "id": "msg456",  
+      "conversationId": "conv123",  
+      "senderId": "123",  
+      "recipientId": "456",  
+      "content": "Hello there!",  
+      "timeSent": "2024-01-15T14:30:00.000Z",  
+      "meta": {  
+        "isUnsent": false,  
+        "isForwarded": false,  
+        "replyTo": null,  
+        "lastEditAt": null  
+      },  
+      "reactions": []  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Empty content:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Message content cannot be empty",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Content too long:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Message content exceeds maximum length (5000 characters)",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### replyToMessage  
+
+**Signature:**  
+```graphql  
+mutation ReplyToMessage(  
+  $conversationId: ID!  
+  $replyToMessageId: ID!  
+  $content: String!  
+): Message!  
+```  
+
+**Description:** Sends message with `meta.replyTo` field set. Cannot reply to unsent messages.  
+
+**Reply Behavior:**  
+- Sets `meta.replyTo` to original message ID  
+- `repliedMessage` field in queries uses DataLoader to fetch original message  
+- If original message is unsent, `repliedMessage.content` returns `null`  
+
+**Content Validation:** Same as `sendMessage` (1-5000 chars after trim).  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  replyToMessage(  
+    conversationId: "conv123"  
+    replyToMessageId: "msg123"  
+    content: "I'm doing well, thanks!"  
+  ) {  
+    id  
+    content  
+    meta {  
+      replyTo  
+    }  
+    repliedMessage {  
+      id  
+      content  
+      senderId  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "replyToMessage": {  
+      "id": "msg789",  
+      "content": "I'm doing well, thanks!",  
+      "meta": {  
+        "replyTo": "msg123"  
+      },  
+      "repliedMessage": {  
+        "id": "msg123",  
+        "content": "Hey, how are you?",  
+        "senderId": "456"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Original message not found:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Original message not found",  
+      "extensions": { "code": "NOT_FOUND" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Cannot reply to unsent:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Cannot reply to unsent message",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### editMessage  
+
+**Signature:**  
+```graphql  
+mutation EditMessage($messageId: ID!, $newContent: String!): Message!  
+```  
+
+**Description:** Edits message content and sets `meta.lastEditAt` timestamp. Only sender can edit.  
+
+**Validation:**  
+- Cannot edit unsent messages  
+- New content follows same rules (1-5000 chars after trim)  
+
+**Side Effects:**  
+1. Updates message content  
+2. Sets `meta.lastEditAt` to current timestamp  
+3. Updates conversation `lastMessage` preview if this was the last message  
+4. Triggers `messageUpdated` subscription  
+
+**Authentication:** **Required**  
+**Authorization:** Must be message sender.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  editMessage(messageId: "msg456", newContent: "Hello there! How are you?") {  
+    id  
+    content  
+    meta {  
+      lastEditAt  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "editMessage": {  
+      "id": "msg456",  
+      "content": "Hello there! How are you?",  
+      "meta": {  
+        "lastEditAt": "2024-01-15T14:35:00.000Z"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Not sender:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Message not found or unauthorized",  
+      "extensions": { "code": "FORBIDDEN" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Cannot edit unsent:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Cannot edit unsent message",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### unsendMessage  
+
+**Signature:**  
+```graphql  
+mutation UnsendMessage($messageId: ID!): Message!  
+```  
+
+**Description:** Marks message as unsent. Content becomes `null` in all queries. Only sender can unsend.  
+
+**Side Effects:**  
+1. Sets `meta.isUnsent` to `true`  
+2. Message remains in database but `content` resolver returns `null`  
+3. Updates conversation `lastMessage` to previous non-unsent message  
+4. Triggers `messageUpdated` subscription  
+
+**Authentication:** **Required**  
+**Authorization:** Must be message sender.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  unsendMessage(messageId: "msg456") {  
+    id  
+    content  
+    meta {  
+      isUnsent  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "unsendMessage": {  
+      "id": "msg456",  
+      "content": null,  
+      "meta": {  
+        "isUnsent": true  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Response:**  
+Same as `editMessage` (not sender, not found).  
+
+---  
+
+#### forwardMessage  
+
+**Signature:**  
+```graphql  
+mutation ForwardMessage(  
+  $messageId: ID!  
+  $toConversationId: ID!  
+): Message!  
+```  
+
+**Description:** Copies message content to different conversation with `meta.isForwarded` flag. Cannot forward unsent messages.  
+
+**Validation:**  
+- Must be participant in source conversation (to access original message)  
+- Must be participant in target conversation  
+- Original message must not be unsent  
+
+**Side Effects:**  
+1. Creates new message in target conversation  
+2. Sets `meta.isForwarded` to `true`  
+3. Copies content but not reactions/replies  
+4. Triggers `messageReceived` subscription in target conversation  
+
+**Authentication:** **Required**  
+**Authorization:** Must be participant in both conversations.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  forwardMessage(messageId: "msg123", toConversationId: "conv456") {  
+    id  
+    conversationId  
+    content  
+    meta {  
+      isForwarded  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "forwardMessage": {  
+      "id": "msg999",  
+      "conversationId": "conv456",  
+      "content": "Hey, how are you?",  
+      "meta": {  
+        "isForwarded": true  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Not participant in source:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "You are not a participant in source conversation",  
+      "extensions": { "code": "FORBIDDEN" }  
+    }  
+  ]  
+}  
+```  
+
+2. **Cannot forward unsent:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Cannot forward unsent message",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### addReaction  
+
+**Signature:**  
+```graphql  
+mutation AddReaction($messageId: ID!, $reactionType: Int!): Message!  
+```  
+
+**Reaction Types:**  
+- Valid range: 1-6 (integers)  
+- Emoji mappings (implementation-specific):  
+  - 1: 👍 (thumbs up)  
+  - 2: ❤️ (heart)  
+  - 3: 😂 (laugh)  
+  - 4: 😮 (wow)  
+  - 5: 😢 (sad)  
+  - 6: 😡 (angry)  
+
+**Behavior:**  
+- Replaces user's existing reaction if one exists (users can only have one reaction per message)  
+- Uses aggregation pipeline to atomically remove old reaction and add new one  
+
+**Side Effects:**  
+- Updates message `reactions` array  
+- Triggers `reactionUpdated` subscription  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  addReaction(messageId: "msg123", reactionType: 1) {  
+    id  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "addReaction": {  
+      "id": "msg123",  
+      "reactions": [  
+        {  
+          "userId": "123",  
+          "type": 1  
+        },  
+        {  
+          "userId": "456",  
+          "type": 2  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Invalid reaction type:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Reaction type must be integer between 1-6",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### removeReaction  
+
+**Signature:**  
+```graphql  
+mutation RemoveReaction($messageId: ID!): Message!  
+```  
+
+**Description:** Removes authenticated user's reaction from message.  
+
+**Side Effects:**  
+- Removes reaction from `reactions` array  
+- Triggers `reactionUpdated` subscription  
+- Succeeds even if user had no reaction (idempotent)  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  removeReaction(messageId: "msg123") {  
+    id  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "removeReaction": {  
+      "id": "msg123",  
+      "reactions": [  
+        {  
+          "userId": "456",  
+          "type": 2  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### markAsRead  
+
+**Signature:**  
+```graphql  
+mutation MarkAsRead($conversationId: ID!): ReadReceipt!  
+```  
+
+**Description:** Updates authenticated user's read timestamp in conversation `readStatus` map.  
+
+**Side Effects:**  
+1. Sets `readStatus[userId]` to current timestamp  
+2. Triggers `readStatusChanged` subscription (filtered to other participant only—sender doesn't receive their own receipt)  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  markAsRead(conversationId: "conv123") {  
+    conversationId  
+    userId  
+    timestamp  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "markAsRead": {  
+      "conversationId": "conv123",  
+      "userId": "123",  
+      "timestamp": "2024-01-15T14:30:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Usage Pattern:**  
+Call when user opens conversation or views new messages. Other participant receives subscription update.  
+
+---  
+
+#### updateLastOnline  
+
+**Signature:**  
+```graphql  
+mutation UpdateLastOnline: User!  
+```  
+
+**Description:** Updates authenticated user's `last_online` timestamp. Rate-limited to once per 60 seconds via Redis cache.  
+
+**Rate Limiting:**  
+- Redis key: `last_online:{userId}`  
+- TTL: 5 minutes  
+- Throttle window: 60 seconds  
+- If called within 60s of last update, returns cached user without DB write  
+
+**Side Effects:**  
+- Updates `users` table in PostgreSQL  
+- Publishes `USER_STATUS_CHANGED` event (no subscription implemented currently)  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  updateLastOnline {  
+    id  
+    lastOnline  
+  }  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "updateLastOnline": {  
+      "id": "123",  
+      "lastOnline": "2024-01-15T14:30:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Frontend Pattern:**  
+Call periodically (e.g., every 2 minutes) to maintain online status:  
+```javascript  
+setInterval(() => {  
+  fetch('/graphql', {  
+    method: 'POST',  
+    credentials: 'include',  
+    body: JSON.stringify({ query: 'mutation { updateLastOnline { id lastOnline } }' })  
+  });  
+}, 120000); // 2 minutes  
+```  
+
+---  
+
+#### setTyping  
+
+**Signature:**  
+```graphql  
+mutation SetTyping($conversationId: ID!, $isTyping: Boolean!): Boolean!  
+```  
+
+**Description:** Broadcasts typing indicator to other participant. Ephemeral—no persistence.  
+
+**Side Effects:**  
+- Triggers `typingIndicator` subscription (filtered to other participant—sender doesn't receive own indicator)  
+- No database write  
+
+**Authentication:** **Required**  
+**Authorization:** Must be conversation participant.  
+
+**Example Request (Start Typing):**  
+```graphql  
+mutation {  
+  setTyping(conversationId: "conv123", isTyping: true)  
+}  
+```  
+
+**Example Request (Stop Typing):**  
+```graphql  
+mutation {  
+  setTyping(conversationId: "conv123", isTyping: false)  
+}  
+```  
+
+**Response:**  
+```json  
+{  
+  "data": {  
+    "setTyping": true  
+  }  
+}  
+```  
+
+**Frontend Pattern:**  
+```javascript  
+const inputField = document.getElementById('message-input');  
+let typingTimeout;  
+
+inputField.addEventListener('input', () => {  
+  // Send typing = true  
+  sendTypingMutation(conversationId, true);  
+  
+  // Clear existing timeout  
+  clearTimeout(typingTimeout);  
+  
+  // Auto-send typing = false after 3 seconds of no input  
+  typingTimeout = setTimeout(() => {  
+    sendTypingMutation(conversationId, false);  
+  }, 3000);  
+});  
+```  
+
+---  
+
+### Subscriptions  
+
+#### messageReceived  
+
+**Signature:**  
+```graphql  
+subscription MessageReceived($conversationId: ID!): Message!  
+```  
+
+**Description:** Fires when any participant sends a message in conversation.  
+
+**Filtering:**  
+- Authenticated user must be conversation participant  
+- Fires for **all** participants (including sender if they have multiple clients)  
+
+**Authentication:** **Required** (via WebSocket cookie)  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  messageReceived(conversationId: "conv123") {  
+    id  
+    conversationId  
+    senderId  
+    recipientId  
+    content  
+    timeSent  
+    meta {  
+      isUnsent  
+      isForwarded  
+      replyTo  
+      lastEditAt  
+    }  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Event Payload:**  
+```json  
+{  
+  "data": {  
+    "messageReceived": {  
+      "id": "msg789",  
+      "conversationId": "conv123",  
+      "senderId": "456",  
+      "recipientId": "123",  
+      "content": "Hey there!",  
+      "timeSent": "2024-01-15T14:35:00.000Z",  
+      "meta": {  
+        "isUnsent": false,  
+        "isForwarded": false,  
+        "replyTo": null,  
+        "lastEditAt": null  
+      },  
+      "reactions": []  
+    }  
+  }  
+}  
+```  
+
+**Frontend Integration:**  
+```javascript  
+const subscription = client.subscribe({  
+  query: gql`  
+    subscription {  
+      messageReceived(conversationId: "conv123") {  
+        id  
+        senderId  
+        content  
+        timeSent  
+      }  
+    }  
+  `  
+});  
+
+subscription.subscribe({  
+  next: ({ data }) => {  
+    // Append message to UI  
+    appendMessage(data.messageReceived);  
+  },  
+  error: (err) => console.error(err)  
+});  
+```  
+
+---  
+
+#### messageUpdated  
+
+**Signature:**  
+```graphql  
+subscription MessageUpdated($conversationId: ID!): Message!  
+```  
+
+**Description:** Fires when message is edited or unsent.  
+
+**Trigger Conditions:**  
+- `editMessage` mutation called  
+- `unsendMessage` mutation called  
+
+**Filtering:**  
+- Authenticated user must be conversation participant  
+- Fires for both participants  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  messageUpdated(conversationId: "conv123") {  
+    id  
+    content  
+    meta {  
+      isUnsent  
+      lastEditAt  
+    }  
+  }  
+}  
+```  
+
+**Event Payload (Edit):**  
+```json  
+{  
+  "data": {  
+    "messageUpdated": {  
+      "id": "msg456",  
+      "content": "Edited message content",  
+      "meta": {  
+        "isUnsent": false,  
+        "lastEditAt": "2024-01-15T14:40:00.000Z"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Event Payload (Unsend):**  
+```json  
+{  
+  "data": {  
+    "messageUpdated": {  
+      "id": "msg456",  
+      "content": null,  
+      "meta": {  
+        "isUnsent": true,  
+        "lastEditAt": null  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+subscription.subscribe({  
+  next: ({ data }) => {  
+    const msg = data.messageUpdated;  
+    if (msg.meta.isUnsent) {  
+      // Replace message content with "Message unsent"  
+      updateMessageUI(msg.id, { content: null, isUnsent: true });  
+    } else if (msg.meta.lastEditAt) {  
+      // Show "Edited" badge  
+      updateMessageUI(msg.id, { content: msg.content, edited: true });  
+    }  
+  }  
+});  
+```  
+
+---  
+
+#### reactionUpdated  
+
+**Signature:**  
+```graphql  
+subscription ReactionUpdated($conversationId: ID!): ReactionUpdate!  
+```  
+
+**Description:** Fires when reactions are added or removed from any message in conversation.  
+
+**Return Type:**  
+```graphql  
+type ReactionUpdate {  
+  messageId: ID!  
+  reactions: [Reaction!]!  
+}  
+```  
+
+**Trigger Conditions:**  
+- `addReaction` mutation called  
+- `removeReaction` mutation called  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  reactionUpdated(conversationId: "conv123") {  
+    messageId  
+    reactions {  
+      userId  
+      type  
+    }  
+  }  
+}  
+```  
+
+**Event Payload:**  
+```json  
+{  
+  "data": {  
+    "reactionUpdated": {  
+      "messageId": "msg123",  
+      "reactions": [  
+        {  
+          "userId": "123",  
+          "type": 1  
+        },  
+        {  
+          "userId": "456",  
+          "type": 2  
+        }  
+      ]  
+    }  
+  }  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+subscription.subscribe({  
+  next: ({ data }) => {  
+    const { messageId, reactions } = data.reactionUpdated;  
+    // Update message reactions in UI  
+    updateMessageReactions(messageId, reactions);  
+  }  
+});  
+```  
+
+---  
+
+#### readStatusChanged  
+
+**Signature:**  
+```graphql  
+subscription ReadStatusChanged($conversationId: ID!): ReadReceipt!  
+```  
+
+**Description:** Fires when other participant marks conversation as read (does NOT fire for own `markAsRead` calls).  
+
+**Filtering:**  
+- Sender does NOT receive their own read receipt  
+- Other participant receives update  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  readStatusChanged(conversationId: "conv123") {  
+    conversationId  
+    userId  
+    timestamp  
+  }  
+}  
+```  
+
+**Event Payload:**  
+```json  
+{  
+  "data": {  
+    "readStatusChanged": {  
+      "conversationId": "conv123",  
+      "userId": "456",  
+      "timestamp": "2024-01-15T14:35:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+subscription.subscribe({  
+  next: ({ data }) => {  
+    const { userId, timestamp } = data.readStatusChanged;  
+    // Update "Read" indicator for messages sent before timestamp  
+    markMessagesAsReadByUser(userId, timestamp);  
+  }  
+});  
+```  
+
+---  
+
+#### typingIndicator  
+
+**Signature:**  
+```graphql  
+subscription TypingIndicator($conversationId: ID!): TypingStatus!  
+```  
+
+**Description:** Fires when other participant starts/stops typing (does NOT fire for own `setTyping` calls).  
+
+**Filtering:**  
+- Sender does NOT receive their own typing indicator  
+- Other participant receives update  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  typingIndicator(conversationId: "conv123") {  
+    conversationId  
+    userId  
+    isTyping  
+  }  
+}  
+```  
+
+**Event Payload (Typing):**  
+```json  
+{  
+  "data": {  
+    "typingIndicator": {  
+      "conversationId": "conv123",  
+      "userId": "456",  
+      "isTyping": true  
+    }  
+  }  
+}  
+```  
+
+**Event Payload (Stopped):**  
+```json  
+{  
+  "data": {  
+    "typingIndicator": {  
+      "conversationId": "conv123",  
+      "userId": "456",  
+      "isTyping": false  
+    }  
+  }  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+subscription.subscribe({  
+  next: ({ data }) => {  
+    const { userId, isTyping } = data.typingIndicator;  
+    if (isTyping) {  
+      showTypingIndicator(userId); // "Alice is typing..."  
+    } else {  
+      hideTypingIndicator(userId);  
+    }  
+  }  
+});  
+```  
+
+---  
+
+### Message Object Structure  
+
+#### repliedMessage Nested Loading  
+
+The `repliedMessage` field uses **DataLoader** to batch-load original messages when `meta.replyTo` is set. This prevents N+1 query issues when fetching conversation history with replies.  
+
+**Example:**  
+```graphql  
+query {  
+  fetchMessages(conversationId: "conv123") {  
+    edges {  
+      node {  
+        id  
+        content  
+        meta {  
+          replyTo  
+        }  
+        repliedMessage {  
+          id  
+          content  
+          senderId  
+          # ⚠️ Cannot nest repliedMessage further (no recursive replies)  
+        }  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Unsent Original Messages:**  
+If replied-to message is unsent, `repliedMessage.content` returns `null`:  
+```json  
+{  
+  "repliedMessage": {  
+    "id": "msg123",  
+    "content": null,  // ← Original was unsent  
+    "senderId": "456"  
+  }  
+}  
+```  
+
+---  
+
+#### Meta Field Mappings (snake_case to camelCase)  
+
+Database stores fields in `snake_case`, GraphQL returns `camelCase`:  
+
+| Database Field | GraphQL Field | Type | Description |  
+|----------------|---------------|------|-------------|  
+| `is_unsent` | `isUnsent` | Boolean | Message was unsent by sender |  
+| `is_forwarded` | `isForwarded` | Boolean | Message was forwarded from another conversation |  
+| `reply_to` | `replyTo` | ID (nullable) | ID of message being replied to |  
+| `last_edit_at` | `lastEditAt` | DateTime (nullable) | Timestamp of last edit |  
+
+**Default Meta Values:**  
+```json  
+{  
+  "meta": {  
+    "isUnsent": false,  
+    "isForwarded": false,  
+    "replyTo": null,  
+    "lastEditAt": null  
+  }  
+}  
+```  
+
+---  
+
+## 5. WebRTC Calling System  
+
+WebRTC calling uses Redis for ephemeral call state (2-hour TTL) and MongoDB for call history persistence. Only friends can call each other.  
+
+### Enums  
+
+#### CallType  
+
+```graphql  
+enum CallType {  
+  voice   # Audio only  
+  video   # Audio + video  
+  screen  # Screen sharing  
+}  
+```  
+
+**Usage:** Passed to `initiateCall` mutation.  
+
+#### CallStatus  
+
+```graphql  
+enum CallStatus {  
+  initiating  # Call being created (brief state)  
+  ringing     # Waiting for recipient to answer  
+  active      # Call in progress (answered)  
+  ended       # Call ended normally  
+  missed      # Call never answered (ringing → ended without answer)  
+  rejected    # Recipient explicitly rejected call  
+}  
+```  
+
+**State Transitions:**  
+- `initiating` → `ringing` (automatic after creation)  
+- `ringing` → `active` (via `answerCall`)  
+- `ringing` → `rejected` (via `rejectCall`)  
+- `ringing` → `missed` (via `endCall` before answer)  
+- `active` → `ended` (via `endCall` after answer)  
+
+---  
+
+### Mutations  
+
+#### initiateCall  
+
+**Signature:**  
+```graphql  
+mutation InitiateCall(  
+  $recipientId: ID!  
+  $callType: CallType!  
+): CallInitiationResponse!  
+```  
+
+**Validation:**  
+1. Cannot call self  
+2. Recipient must exist  
+3. Must be friends with recipient (checks PostgreSQL)  
+
+**Behavior:**  
+1. Generates UUID for call ID  
+2. Stores call state in Redis with 2-hour TTL  
+3. Transitions `initiating` → `ringing`  
+4. Triggers `incomingCall` subscription for recipient  
+5. Returns STUN server configuration  
+
+**STUN Servers Provided:**  
+- `stun:stun.l.google.com:19302`  
+- `stun:stun1.l.google.com:19302`  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  initiateCall(recipientId: "456", callType: video) {  
+    success  
+    message  
+    call {  
+      id  
+      participantIds  
+      type  
+      status  
+      startTime  
+    }  
+    stunServers {  
+      urls  
+    }  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "initiateCall": {  
+      "success": true,  
+      "message": "Call initiated successfully",  
+      "call": {  
+        "id": "call-uuid-123",  
+        "participantIds": ["123", "456"],  
+        "type": "video",  
+        "status": "ringing",  
+        "startTime": "2024-01-15T14:30:00.000Z"  
+      },  
+      "stunServers": {  
+        "urls": [  
+          "stun:stun.l.google.com:19302",  
+          "stun:stun1.l.google.com:19302"  
+        ]  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Cannot call self:**  
+```json  
+{  
+  "data": {  
+    "initiateCall": {  
+      "success": false,  
+      "message": "Cannot call yourself",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+2. **Not friends:**  
+```json  
+{  
+  "data": {  
+    "initiateCall": {  
+      "success": false,  
+      "message": "You can only call friends",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+
+#### answerCall  
+
+**Signature:**  
+```graphql  
+mutation AnswerCall($callId: ID!): CallInitiationResponse!  
+```  
+
+**Description:** Transitions call from `ringing` to `active` state. Only recipient can answer.  
+
+**Authorization:** Must be the recipient (second participant in `participantIds` array).  
+
+**Behavior:**  
+1. Validates call exists in Redis  
+2. Validates current user is recipient (`participantIds[1]`)  
+3. Validates call status is `ringing`  
+4. Sets `answerTime` timestamp  
+5. Transitions to `active` status  
+6. Triggers `callStateChanged` subscription for both participants  
+7. Returns STUN servers for WebRTC negotiation  
+
+**Authentication:** **Required**  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  answerCall(callId: "call-uuid-123") {  
+    success  
+    message  
+    call {  
+      id  
+      participantIds  
+      type  
+      status  
+      startTime  
+    }  
+    stunServers {  
+      urls  
+    }  
+  }  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "answerCall": {  
+      "success": true,  
+      "message": "Call answered",  
+      "call": {  
+        "id": "call-uuid-123",  
+        "participantIds": ["123", "456"],  
+        "type": "video",  
+        "status": "active",  
+        "startTime": "2024-01-15T14:30:00.000Z"  
+      },  
+      "stunServers": {  
+        "urls": [  
+          "stun:stun.l.google.com:19302",  
+          "stun:stun1.l.google.com:19302"  
+        ]  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+
+1. **Call not found/expired:**  
+```json  
+{  
+  "data": {  
+    "answerCall": {  
+      "success": false,  
+      "message": "Call not found or expired",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+2. **Not recipient:**  
+```json  
+{  
+  "data": {  
+    "answerCall": {  
+      "success": false,  
+      "message": "Unauthorized to answer this call",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+3. **Wrong status:**  
+```json  
+{  
+  "data": {  
+    "answerCall": {  
+      "success": false,  
+      "message": "Cannot answer call in ended state",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### rejectCall  
+
+**Signature:**  
+```graphql  
+mutation RejectCall($callId: ID!): Boolean!  
+```  
+
+**Description:** Explicitly rejects incoming call. Available to either participant.  
+
+**Behavior:**  
+1. Validates call exists in Redis  
+2. Validates user is a participant  
+3. Sets status to `rejected`  
+4. Saves call to MongoDB call history (no duration)  
+5. Deletes call from Redis  
+6. Triggers `callStateChanged` subscription  
+
+**Authentication:** **Required**  
+**Authorization:** Must be call participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  rejectCall(callId: "call-uuid-123")  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "rejectCall": true  
+  }  
+}  
+```  
+
+**Error Response:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Call not found",  
+      "extensions": {  
+        "code": "NOT_FOUND"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Usage Pattern:**  
+Recipient uses this when declining incoming call. Initiator can also reject before recipient answers (cancel call).  
+
+---  
+
+#### endCall  
+
+**Signature:**  
+```graphql  
+mutation EndCall($callId: ID!): Boolean!  
+```  
+
+**Description:** Ends active call or marks ringing call as missed. Calculates duration if call was answered.  
+
+**Behavior:**  
+1. Validates call exists and user is participant  
+2. Calculates duration if status is `active` (endTime - answerTime)  
+3. Sets status to `missed` if status was `ringing`, otherwise `ended`  
+4. Saves call to MongoDB as message with `call_metadata`  
+5. Deletes call from Redis  
+6. Triggers `callStateChanged` subscription  
+
+**Call History Message Structure:**  
+```javascript  
+{  
+  conversation_id: ObjectId,  
+  sender_id: initiatorId,  
+  recipient_id: recipientId,  
+  content: "VIDEO call",  // or "VOICE call", "SCREEN call"  
+  time_sent: startTime,  
+  call_metadata: {  
+    type: "video",  
+    duration: 125,  // seconds (null if never answered)  
+    status: "completed",  // or "missed"  
+    initiated_by: initiatorId  
+  }  
+}  
+```  
+
+**Authentication:** **Required**  
+**Authorization:** Must be call participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  endCall(callId: "call-uuid-123")  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "endCall": true  
+  }  
+}  
+```  
+
+**Error Scenarios:**  
+Same as `rejectCall` (NOT_FOUND, FORBIDDEN).  
+
+**Usage Pattern:**  
+Either participant calls this to terminate call. Frontend should:  
+1. Close peer connection  
+2. Stop media streams  
+3. Call `endCall` mutation  
+4. Clean up UI state  
+
+---  
+
+#### sendSDPOffer  
+
+**Signature:**  
+```graphql  
+mutation SendSDPOffer($callId: ID!, $sdp: JSON!): Boolean!  
+```  
+
+**Description:** Sends WebRTC SDP offer to other peer via subscription.  
+
+**SDP Structure:**  
+```javascript  
+{  
+  type: "offer",  
+  sdp: "v=0\r\no=- 123456789 2 IN IP4 127.0.0.1\r\n..."  
+}  
+```  
+
+**Behavior:**  
+1. Validates call exists and user is participant  
+2. Publishes to `callSignal` subscription  
+3. Other peer receives signal via subscription  
+4. No persistence (real-time only)  
+
+**Authentication:** **Required**  
+**Authorization:** Must be call participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  sendSDPOffer(  
+    callId: "call-uuid-123"  
+    sdp: {  
+      type: "offer"  
+      sdp: "v=0\r\no=- 1234567890 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream123\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:abcd\r\na=ice-pwd:efgh1234567890\r\na=ice-options:trickle\r\na=fingerprint:sha-256 AA:BB:CC:DD...\r\na=setup:actpass\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\n"  
+    }  
+  )  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "sendSDPOffer": true  
+  }  
+}  
+```  
+
+**Error Response:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Call not found",  
+      "extensions": {  
+        "code": "NOT_FOUND"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Real-World Flow:**  
+```javascript  
+// Initiator creates peer connection after initiateCall  
+const pc = new RTCPeerConnection({ iceServers: stunServers });  
+
+// Add local media tracks  
+localStream.getTracks().forEach(track => pc.addTrack(track, localStream));  
+
+// Create and send offer  
+const offer = await pc.createOffer();  
+await pc.setLocalDescription(offer);  
+
+await sendSDPOfferMutation({  
+  callId,  
+  sdp: {  
+    type: offer.type,  
+    sdp: offer.sdp  
+  }  
+});  
+```  
+
+---  
+
+#### sendSDPAnswer  
+
+**Signature:**  
+```graphql  
+mutation SendSDPAnswer($callId: ID!, $sdp: JSON!): Boolean!  
+```  
+
+**Description:** Sends WebRTC SDP answer to other peer via subscription.  
+
+**SDP Structure:**  
+```javascript  
+{  
+  type: "answer",  
+  sdp: "v=0\r\no=- 987654321 2 IN IP4 127.0.0.1\r\n..."  
+}  
+```  
+
+**Behavior:** Identical to `sendSDPOffer` but called by recipient after receiving offer.  
+
+**Authentication:** **Required**  
+**Authorization:** Must be call participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  sendSDPAnswer(  
+    callId: "call-uuid-123"  
+    sdp: {  
+      type: "answer"  
+      sdp: "v=0\r\no=- 9876543210 2 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\na=group:BUNDLE 0\r\na=extmap-allow-mixed\r\na=msid-semantic: WMS stream456\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\nc=IN IP4 0.0.0.0\r\na=rtcp:9 IN IP4 0.0.0.0\r\na=ice-ufrag:ijkl\r\na=ice-pwd:mnop1234567890\r\na=ice-options:trickle\r\na=fingerprint:sha-256 11:22:33:44...\r\na=setup:active\r\na=mid:0\r\na=sendrecv\r\na=rtcp-mux\r\na=rtpmap:96 VP8/90000\r\n"  
+    }  
+  )  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "sendSDPAnswer": true  
+  }  
+}  
+```  
+
+**Real-World Flow:**  
+```javascript  
+// Recipient receives offer via callSignal subscription  
+// Then creates answer  
+const pc = new RTCPeerConnection({ iceServers: stunServers });  
+
+// Add local media tracks  
+localStream.getTracks().forEach(track => pc.addTrack(track, localStream));  
+
+// Set remote description (offer)  
+await pc.setRemoteDescription(offerFromSubscription);  
+
+// Create and send answer  
+const answer = await pc.createAnswer();  
+await pc.setLocalDescription(answer);  
+
+await sendSDPAnswerMutation({  
+  callId,  
+  sdp: {  
+    type: answer.type,  
+    sdp: answer.sdp  
+  }  
+});  
+```  
+
+---  
+
+#### sendICECandidate  
+
+**Signature:**  
+```graphql  
+mutation SendICECandidate($callId: ID!, $candidate: JSON!): Boolean!  
+```  
+
+**Description:** Sends ICE candidate to other peer for WebRTC connection establishment.  
+
+**Candidate Structure:**  
+```javascript  
+{  
+  candidate: "candidate:1 1 UDP 2130706431 192.168.1.100 54321 typ host",  
+  sdpMLineIndex: 0,  
+  sdpMid: "0"  
+}  
+```  
+
+**Behavior:**  
+1. Validates call exists and user is participant  
+2. Publishes to `callSignal` subscription  
+3. Other peer receives and adds candidate to peer connection  
+4. Multiple candidates sent as discovered (trickle ICE)  
+
+**Authentication:** **Required**  
+**Authorization:** Must be call participant.  
+
+**Example Request:**  
+```graphql  
+mutation {  
+  sendICECandidate(  
+    callId: "call-uuid-123"  
+    candidate: {  
+      candidate: "candidate:842163049 1 udp 1677729535 203.0.113.45 54321 typ srflx raddr 192.168.1.100 rport 54321"  
+      sdpMLineIndex: 0  
+      sdpMid: "0"  
+    }  
+  )  
+}  
+```  
+
+**Success Response:**  
+```json  
+{  
+  "data": {  
+    "sendICECandidate": true  
+  }  
+}  
+```  
+
+**Real-World Flow:**  
+```javascript  
+// Listen for ICE candidates during connection setup  
+pc.addEventListener('icecandidate', (event) => {  
+  if (event.candidate) {  
+    sendICECandidateMutation({  
+      callId,  
+      candidate: {  
+        candidate: event.candidate.candidate,  
+        sdpMLineIndex: event.candidate.sdpMLineIndex,  
+        sdpMid: event.candidate.sdpMid  
+      }  
+    });  
+  }  
+});  
+```  
+
+---  
+
+### Subscriptions  
+
+#### incomingCall  
+
+**Signature:**  
+```graphql  
+subscription IncomingCall: IncomingCallNotification!  
+```  
+
+**Description:** Fires when someone initiates a call to authenticated user. Filtered to recipient only.  
+
+**Filtering:**  
+- Only the recipient (`participantIds[1]`) receives this event  
+- Initiator does not receive their own call notification  
+
+**Return Type:**  
+```graphql  
+type IncomingCallNotification {  
+  call: Call!  
+  caller: User!  
+}  
+```  
+
+**Authentication:** **Required** (via WebSocket cookie)  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  incomingCall {  
+    call {  
+      id  
+      participantIds  
+      type  
+      status  
+      startTime  
+    }  
+    caller {  
+      id  
+      username  
+    }  
+  }  
+}  
+```  
+
+**Event Payload:**  
+```json  
+{  
+  "data": {  
+    "incomingCall": {  
+      "call": {  
+        "id": "call-uuid-123",  
+        "participantIds": ["123", "456"],  
+        "type": "video",  
+        "status": "ringing",  
+        "startTime": "2024-01-15T14:30:00.000Z"  
+      },  
+      "caller": {  
+        "id": "123",  
+        "username": "alice_smith"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Frontend Integration:**  
+```javascript  
+const subscription = client.subscribe({  
+  query: gql`  
+    subscription {  
+      incomingCall {  
+        call {  
+          id  
+          type  
+          status  
+        }  
+        caller {  
+          id  
+          username  
+        }  
+      }  
+    }  
+  `  
+});  
+
+subscription.subscribe({  
+  next: ({ data }) => {  
+    const { call, caller } = data.incomingCall;  
+    
+    // Show incoming call UI  
+    showIncomingCallDialog({  
+      callId: call.id,  
+      callerName: caller.username,  
+      callType: call.type,  
+      onAccept: () => answerCall(call.id),  
+      onReject: () => rejectCall(call.id)  
+    });  
+    
+    // Play ringtone  
+    playRingtone();  
+  },  
+  error: (err) => console.error('Subscription error:', err)  
+});  
+```  
+
+---  
+
+#### callSignal  
+
+**Signature:**  
+```graphql  
+subscription CallSignal($callId: ID!): CallSignal!  
+```  
+
+**Description:** Receives SDP offers/answers and ICE candidates from other peer. Filtered to exclude sender.  
+
+**Return Type:**  
+```graphql  
+type CallSignal {  
+  callId: ID!  
+  senderId: String!  
+  type: String!  # "offer", "answer", "ice-candidate"  
+  payload: JSON!  
+}  
+```  
+
+**Filtering:**  
+- Only the **other peer** receives signals (sender does not receive own signals)  
+- Both participants must be in the call  
+- Call must exist in Redis  
+
+**Signal Routing:**  
+- Initiator sends offer → Recipient receives it  
+- Recipient sends answer → Initiator receives it  
+- Both send ICE candidates → Other peer receives them  
+
+**Authentication:** **Required**  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  callSignal(callId: "call-uuid-123") {  
+    callId  
+    senderId  
+    type  
+    payload  
+  }  
+}  
+```  
+
+**Event Payloads:**  
+
+**SDP Offer:**  
+```json  
+{  
+  "data": {  
+    "callSignal": {  
+      "callId": "call-uuid-123",  
+      "senderId": "123",  
+      "type": "offer",  
+      "payload": {  
+        "type": "offer",  
+        "sdp": "v=0\r\no=- 1234567890 2 IN IP4 127.0.0.1\r\n..."  
+      }  
+    }  
+  }  
+}  
+```  
+
+**SDP Answer:**  
+```json  
+{  
+  "data": {  
+    "callSignal": {  
+      "callId": "call-uuid-123",  
+      "senderId": "456",  
+      "type": "answer",  
+      "payload": {  
+        "type": "answer",  
+        "sdp": "v=0\r\no=- 9876543210 2 IN IP4 127.0.0.1\r\n..."  
+      }  
+    }  
+  }  
+}  
+```  
+
+**ICE Candidate:**  
+```json  
+{  
+  "data": {  
+    "callSignal": {  
+      "callId": "call-uuid-123",  
+      "senderId": "456",  
+      "type": "ice-candidate",  
+      "payload": {  
+        "candidate": "candidate:842163049 1 udp 1677729535 203.0.113.45 54321 typ srflx",  
+        "sdpMLineIndex": 0,  
+        "sdpMid": "0"  
+      }  
+    }  
+  }  
+}  
+```  
+
+**Frontend Integration:**  
+```javascript  
+const signalSubscription = client.subscribe({  
+  query: gql`  
+    subscription CallSignal($callId: ID!) {  
+      callSignal(callId: $callId) {  
+        senderId  
+        type  
+        payload  
+      }  
+    }  
+  `,  
+  variables: { callId }  
+});  
+
+signalSubscription.subscribe({  
+  next: async ({ data }) => {  
+    const { type, payload } = data.callSignal;  
+    
+    if (type === 'offer') {  
+      // Recipient receives offer  
+      await peerConnection.setRemoteDescription(payload);  
+      const answer = await peerConnection.createAnswer();  
+      await peerConnection.setLocalDescription(answer);  
+      await sendSDPAnswerMutation({ callId, sdp: answer });  
+      
+    } else if (type === 'answer') {  
+      // Initiator receives answer  
+      await peerConnection.setRemoteDescription(payload);  
+      
+    } else if (type === 'ice-candidate') {  
+      // Both receive ICE candidates  
+      const candidate = new RTCIceCandidate(payload);  
+      await peerConnection.addIceCandidate(candidate);  
+    }  
+  }  
+});  
+```  
+
+---  
+
+#### callStateChanged  
+
+**Signature:**  
+```graphql  
+subscription CallStateChanged($callId: ID!): CallStateChange!  
+```  
+
+**Description:** Fires on call state transitions (ringing → active, active → ended, etc.). Both participants receive this.  
+
+**Return Type:**  
+```graphql  
+type CallStateChange {  
+  callId: ID!  
+  status: CallStatus!  
+  timestamp: DateTime!  
+}  
+```  
+
+**Trigger Conditions:**  
+- `answerCall` → `active` status  
+- `rejectCall` → `rejected` status  
+- `endCall` → `ended` or `missed` status  
+
+**Filtering:**  
+- Both participants receive state changes  
+- Must be call participant  
+
+**Authentication:** **Required**  
+
+**Example Subscription:**  
+```graphql  
+subscription {  
+  callStateChanged(callId: "call-uuid-123") {  
+    callId  
+    status  
+    timestamp  
+  }  
+}  
+```  
+
+**Event Payloads:**  
+
+**Call Answered:**  
+```json  
+{  
+  "data": {  
+    "callStateChanged": {  
+      "callId": "call-uuid-123",  
+      "status": "active",  
+      "timestamp": "2024-01-15T14:30:15.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Call Rejected:**  
+```json  
+{  
+  "data": {  
+    "callStateChanged": {  
+      "callId": "call-uuid-123",  
+      "status": "rejected",  
+      "timestamp": "2024-01-15T14:30:10.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Call Ended:**  
+```json  
+{  
+  "data": {  
+    "callStateChanged": {  
+      "callId": "call-uuid-123",  
+      "status": "ended",  
+      "timestamp": "2024-01-15T14:35:00.000Z"  
+    }  
+  }  
+}  
+```  
+
+**Frontend Integration:**  
+```javascript  
+const stateSubscription = client.subscribe({  
+  query: gql`  
+    subscription CallStateChanged($callId: ID!) {  
+      callStateChanged(callId: $callId) {  
+        status  
+        timestamp  
+      }  
+    }  
+  `,  
+  variables: { callId }  
+});  
+
+stateSubscription.subscribe({  
+  next: ({ data }) => {  
+    const { status } = data.callStateChanged;  
+    
+    if (status === 'active') {  
+      // Call connected  
+      hideRingingUI();  
+      showActiveCallUI();  
+      startCallTimer();  
+      
+    } else if (status === 'rejected') {  
+      // Call was rejected  
+      stopRingtone();  
+      showNotification('Call rejected');  
+      cleanupCall();  
+      
+    } else if (status === 'ended' || status === 'missed') {  
+      // Call ended  
+      stopCallTimer();  
+      closePeerConnection();  
+      showCallEndedUI();  
+    }  
+  }  
+});  
+```  
+
+---  
+
+### Complete WebRTC Flow Diagram  
+
+```mermaid  
+sequenceDiagram  
+    participant A as Initiator (Alice)  
+    participant S as GraphQL Server  
+    participant R as Recipient (Bob)  
+    participant Redis as Redis  
+    participant Mongo as MongoDB  
+
+    Note over A,Mongo: Call Setup Phase  
+    
+    A->>S: mutation initiateCall(recipientId: Bob, callType: video)  
+    S->>Redis: Store call state (TTL: 2h)  
+    S->>R: subscription incomingCall → { call, caller }  
+    S-->>A: { success: true, call, stunServers }  
+    
+    Note over R: Bob receives incoming call notification  
+    R->>R: Show incoming call UI  
+    R->>S: mutation answerCall(callId)  
+    S->>Redis: Update call status → "active"  
+    S->>A: subscription callStateChanged → { status: "active" }  
+    S->>R: subscription callStateChanged → { status: "active" }  
+    S-->>R: { success: true, call, stunServers }  
+    
+    Note over A,R: WebRTC Negotiation Phase  
+    
+    A->>A: Create RTCPeerConnection  
+    A->>A: addTrack(localStream)  
+    A->>A: createOffer()  
+    A->>S: mutation sendSDPOffer(callId, sdp)  
+    S->>R: subscription callSignal → { type: "offer", payload: SDP }  
+    
+    R->>R: setRemoteDescription(offer)  
+    R->>R: createAnswer()  
+    R->>S: mutation sendSDPAnswer(callId, sdp)  
+    S->>A: subscription callSignal → { type: "answer", payload: SDP }  
+    
+    A->>A: setRemoteDescription(answer)  
+    
+    Note over A,R: ICE Candidate Exchange (Trickle)  
+    
+    par Alice sends candidates  
+        A->>S: mutation sendICECandidate(candidate1)  
+        S->>R: subscription callSignal → { type: "ice-candidate" }  
+        A->>S: mutation sendICECandidate(candidate2)  
+        S->>R: subscription callSignal → { type: "ice-candidate" }  
+    and Bob sends candidates  
+        R->>S: mutation sendICECandidate(candidate1)  
+        S->>A: subscription callSignal → { type: "ice-candidate" }  
+        R->>S: mutation sendICECandidate(candidate2)  
+        S->>A: subscription callSignal → { type: "ice-candidate" }  
+    end  
+    
+    Note over A,R: Connection Established - Media Flows via WebRTC (P2P)  
+    
+    Note over A,R: Active Call (duration tracked)  
+    
+    Note over A,R: Call Termination Phase  
+    
+    A->>A: User clicks "End Call"  
+    A->>A: Close RTCPeerConnection  
+    A->>S: mutation endCall(callId)  
+    S->>Redis: Get call data, calculate duration  
+    S->>Mongo: Save call history as Message with call_metadata  
+    S->>Redis: Delete call state  
+    S->>A: subscription callStateChanged → { status: "ended" }  
+    S->>R: subscription callStateChanged → { status: "ended" }  
+    S-->>A: true  
+    
+    R->>R: Close RTCPeerConnection  
+    R->>R: Clean up UI  
+```  
+
+**Key Flow Points:**  
+
+1. **Initiator Flow:**  
+   - Call `initiateCall` → Get `callId` and `stunServers`  
+   - Create `RTCPeerConnection` with STUN servers  
+   - Subscribe to `callSignal` and `callStateChanged`  
+   - Wait for `active` state via subscription  
+   - Generate SDP offer → `sendSDPOffer`  
+   - Listen for SDP answer via `callSignal` subscription  
+   - Send ICE candidates as discovered  
+   - Receive remote ICE candidates and add to peer connection  
+   - When ending: `endCall` mutation  
+
+2. **Recipient Flow:**  
+   - Subscribe to `incomingCall` (persistent subscription)  
+   - Receive notification → Show incoming call UI  
+   - User accepts → `answerCall` mutation  
+   - Create `RTCPeerConnection` with returned STUN servers  
+   - Subscribe to `callSignal` and `callStateChanged`  
+   - Receive SDP offer via `callSignal` subscription  
+   - Generate SDP answer → `sendSDPAnswer`  
+   - Send ICE candidates as discovered  
+   - Receive remote ICE candidates and add to peer connection  
+   - When ending: `endCall` mutation  
+
+3. **Rejection Flow:**  
+   - Recipient calls `rejectCall` instead of `answerCall`  
+   - Both participants receive `callStateChanged` → `rejected`  
+   - Call saved to history with no duration  
+
+4. **Missed Call Flow:**  
+   - Initiator calls `endCall` while status is still `ringing`  
+   - Backend sets status to `missed`  
+   - Saved to history with `status: "missed"` and no duration  
+
+---  
+
+### Call Persistence: Redis vs MongoDB Strategy  
+
+**Redis (Ephemeral State):**  
+- **Purpose:** Active call state management  
+- **TTL:** 2 hours (7200 seconds)  
+- **Data Stored:**  
+  ```javascript  
+  {  
+    id: "uuid",  
+    participantIds: ["user1", "user2"],  
+    type: "video",  
+    status: "active",  
+    startTime: "2024-01-15T14:30:00.000Z",  
+    answerTime: "2024-01-15T14:30:15.000Z"  // Set when answered  
+  }  
+  ```  
+- **Lifecycle:**  
+  - Created on `initiateCall`  
+  - Updated on `answerCall` (adds `answerTime`, status → `active`)  
+  - Deleted on `endCall` or `rejectCall`  
+  - Auto-expires after 2 hours if not cleaned up (safety net)  
+
+**MongoDB (Persistent History):**  
+- **Purpose:** Call history and conversation timeline  
+- **Storage Location:** `messages` collection with `call_metadata` field  
+- **Data Stored:**  
+  ```javascript  
+  {  
+    _id: ObjectId,  
+    conversation_id: ObjectId,  
+    sender_id: "initiatorUserId",  
+    recipient_id: "recipientUserId",  
+    content: "VIDEO call",  // or "VOICE call", "SCREEN call"  
+    time_sent: startTime,  
+    meta: {  
+      is_unsent: false,  
+      is_forwarded: false,  
+      reply_to: null,  
+      last_edit_at: null  
+    },  
+    reactions: [],  
+    call_metadata: {  
+      type: "video",  
+      duration: 125,  // seconds (null if never answered)  
+      status: "completed",  // or "missed", "rejected"  
+      initiated_by: "initiatorUserId"  
+    }  
+  }  
+  ```  
+- **Lifecycle:**  
+  - Created on `endCall` or `rejectCall`  
+  - Appears in conversation message history  
+  - Frontend can display call entries in chat timeline  
+  - Never deleted (permanent history)  
+
+**Why This Strategy:**  
+1. **Performance:** Redis provides fast read/write for signaling lookups  
+2. **Scalability:** Active calls are small dataset; completed calls in MongoDB  
+3. **Separation:** Real-time state vs historical data  
+4. **TTL Safety:** Abandoned calls auto-clean from Redis  
+5. **Conversation Integration:** Call history appears as special message type in chat  
+
+**Frontend Pattern for Call History:**  
+```javascript  
+// Fetch messages with call metadata  
+const { data } = await fetchMessages({ conversationId });  
+
+data.fetchMessages.edges.forEach(({ node: msg }) => {  
+  if (msg.call_metadata) {  
+    // Render call entry  
+    renderCallHistoryEntry({  
+      type: msg.call_metadata.type,  
+      duration: msg.call_metadata.duration,  
+      status: msg.call_metadata.status,  
+      timestamp: msg.timeSent,  
+      initiatedBy: msg.call_metadata.initiated_by  
+    });  
+  } else {  
+    // Render regular message  
+    renderMessage(msg);  
+  }  
+});  
+```  
+
+---  
+
+## 6. Subscription Connection Guide  
+
+### WebSocket Endpoint and Protocol  
+
+**Endpoint:** `ws://localhost:4000/graphql` (same path as HTTP, different protocol)  
+
+**Protocol:** `graphql-transport-ws` (modern WebSocket protocol)  
+- Supersedes legacy `subscriptions-transport-ws`  
+- Supported by `graphql-ws` npm package  
+- Better error handling and connection lifecycle management  
+- Apollo Client v3+ compatible  
+
+**Subprotocol Negotiation:**  
+Server supports both `graphql-transport-ws` and `graphql-ws` subprotocols via WebSocket handshake.  
+
+---  
+
+### Cookie-Based Authentication for Subscriptions  
+
+**How It Works:**  
+1. User logs in via HTTP `login` mutation → Server sets `connect.sid` cookie  
+2. Frontend establishes WebSocket connection → Browser automatically includes cookies in handshake  
+3. Server extracts `connect.sid` from `Cookie` header during WebSocket `onConnect`  
+4. Server looks up session in Redis  
+5. If valid, attaches `user` object to subscription context  
+6. All subscriptions have access to authenticated user via `context.user`  
+
+**Important:** Cookies are sent automatically by the browser—**no additional headers needed** in WebSocket connection.  
+
+**Cookie Handling Differences:**  
+- **HTTP Requests:** Use `credentials: 'include'` in fetch options  
+- **WebSocket:** Browser handles cookies automatically (same-origin or CORS with proper configuration)  
+
+---  
+
+### Connection Initialization Examples  
+
+#### Apollo Client (React)  
+
+**Installation:**  
+```bash  
+npm install @apollo/client graphql-ws  
+```  
+
+**Setup:**  
+```javascript  
+import { ApolloClient, InMemoryCache, HttpLink, split } from '@apollo/client';  
+import { GraphQLWsLink } from '@apollo/client/link/subscriptions';  
+import { getMainDefinition } from '@apollo/client/utilities';  
+import { createClient } from 'graphql-ws';  
+
+// HTTP link for queries and mutations  
+const httpLink = new HttpLink({  
+  uri: 'http://localhost:4000/graphql',  
+  credentials: 'include'  // Critical for cookies  
+});  
+
+// WebSocket link for subscriptions  
+const wsLink = new GraphQLWsLink(createClient({  
+  url: 'ws://localhost:4000/graphql',  
+  // Cookies are sent automatically—no connectionParams needed  
+}));  
+
+// Split traffic based on operation type  
+const splitLink = split(  
+  ({ query }) => {  
+    const definition = getMainDefinition(query);  
+    return (  
+      definition.kind === 'OperationDefinition' &&  
+      definition.operation === 'subscription'  
+    );  
+  },  
+  wsLink,   // Use WebSocket for subscriptions  
+  httpLink  // Use HTTP for queries/mutations  
+);  
+
+const client = new ApolloClient({  
+  link: splitLink,  
+  cache: new InMemoryCache(),  
+});  
+
+export default client;  
+```  
+
+**Using Subscriptions:**  
+```javascript  
+import { useSubscription, gql } from '@apollo/client';  
+
+const MESSAGE_RECEIVED = gql`  
+  subscription MessageReceived($conversationId: ID!) {  
+    messageReceived(conversationId: $conversationId) {  
+      id  
+      senderId  
+      content  
+      timeSent  
+    }  
+  }  
+`;  
+
+function ChatRoom({ conversationId }) {  
+  const { data, loading, error } = useSubscription(MESSAGE_RECEIVED, {  
+    variables: { conversationId },  
+    onData: ({ data }) => {  
+      console.log('New message:', data.data.messageReceived);  
+      // Update UI  
+    }  
+  });  
+
+  if (error) return <div>Subscription error: {error.message}</div>;  
+
+  return <div>Chat interface</div>;  
+}  
+```  
+
+---  
+
+#### urql (Alternative Client)  
+
+**Installation:**  
+```bash  
+npm install @urql/core @urql/exchange-graphcache wonka graphql-ws  
+```  
+
+**Setup:**  
+```javascript  
+import { createClient, subscriptionExchange, cacheExchange, fetchExchange } from '@urql/core';  
+import { createClient as createWSClient } from 'graphql-ws';  
+
+const wsClient = createWSClient({  
+  url: 'ws://localhost:4000/graphql',  
+});  
+
+const client = createClient({  
+  url: 'http://localhost:4000/graphql',  
+  fetchOptions: {  
+    credentials: 'include',  
+  },  
+  exchanges: [  
+    cacheExchange,  
+    fetchExchange,  
+    subscriptionExchange({  
+      forwardSubscription: (operation) => ({  
+        subscribe: (sink) => ({  
+          unsubscribe: wsClient.subscribe(operation, sink),  
+        }),  
+      }),  
+    }),  
+  ],  
+});  
+```  
+
+---  
+
+#### Vanilla JavaScript (No Framework)  
+
+**Using graphql-ws Library:**  
+```javascript  
+import { createClient } from 'graphql-ws';  
+
+const wsClient = createClient({  
+  url: 'ws://localhost:4000/graphql',  
+  // Cookies sent automatically by browser  
+});  
+
+// Subscribe to incoming calls  
+const unsubscribe = wsClient.subscribe(  
+  {  
+    query: `  
+      subscription {  
+        incomingCall {  
+          call {  
+            id  
+            type  
+            status  
+          }  
+          caller {  
+            username  
+          }  
+        }  
+      }  
+    `,  
+  },  
+  {  
+    next: (data) => {  
+      console.log('Incoming call:', data);  
+      // Handle call notification  
+    },  
+    error: (error) => {  
+      console.error('Subscription error:', error);  
+    },  
+    complete: () => {  
+      console.log('Subscription completed');  
+    },  
+  }  
+);  
+
+// Later: unsubscribe when component unmounts  
+unsubscribe();  
+```  
+
+---  
+
+### Handling Connection Drops and Reconnection  
+
+**Common Causes:**  
+- Network interruption  
+- Server restart  
+- Session expiration  
+- Browser tab backgrounded (mobile)  
+
+**Apollo Client Auto-Reconnection:**  
+Apollo Client's `GraphQLWsLink` automatically handles reconnection with exponential backoff. No additional configuration needed.  
+
+**Manual Reconnection Handling:**  
+```javascript  
+const wsClient = createClient({  
+  url: 'ws://localhost:4000/graphql',  
+  
+  // Retry connection on close  
+  retryAttempts: 5,  
+  retryWait: async (retryCount) => {  
+    await new Promise(resolve => setTimeout(resolve, Math.min(1000 * 2 ** retryCount, 10000)));  
+  },  
+  
+  // Handle connection events  
+  on: {  
+    connected: () => console.log('WebSocket connected'),  
+    closed: (event) => console.log('WebSocket closed', event),  
+    error: (error) => console.error('WebSocket error', error),  
+  },  
+  
+  // Session validation  
+  connectionParams: async () => {  
+    // Check if session is still valid before reconnecting  
+    const response = await fetch('http://localhost:4000/graphql', {  
+      method: 'POST',  
+      credentials: 'include',  
+      headers: { 'Content-Type': 'application/json' },  
+      body: JSON.stringify({ query: '{ me { id } }' }),  
+    });  
+    
+    const { errors } = await response.json();  
+    if (errors) {  
+      // Session expired—redirect to login  
+      window.location.href = '/login';  
+      throw new Error('Session expired');  
+    }  
+    
+    return {};  // Cookies sent automatically  
+  },  
+});  
+```  
+
+**Subscription Lifecycle Management:**  
+```javascript  
+import { useEffect } from 'react';  
+import { useSubscription } from '@apollo/client';  
+
+function ChatComponent({ conversationId }) {  
+  const { data, error } = useSubscription(MESSAGE_RECEIVED, {  
+    variables: { conversationId },  
+    shouldResubscribe: true,  // Resubscribe on connection restore  
+  });  
+
+  useEffect(() => {  
+    // Component mounted—subscription started  
+    console.log('Subscribed to messages');  
+    
+    return () => {  
+      // Component unmounted—subscription automatically cleaned up  
+      console.log('Unsubscribed from messages');  
+    };  
+  }, [conversationId]);  
+
+  if (error) {  
+    if (error.message.includes('UNAUTHENTICATED')) {  
+      // Session expired during subscription  
+      window.location.href = '/login';  
+    }  
+    return <div>Error: {error.message}</div>;  
+  }  
+
+  return <div>{/* Chat UI */}</div>;  
+}  
+```  
+
+**Best Practices:**  
+1. **Subscribe on Mount:** Start subscriptions when component mounts  
+2. **Unsubscribe on Unmount:** Clean up to prevent memory leaks  
+3. **Handle UNAUTHENTICATED Errors:** Redirect to login if session expired  
+4. **Debounce Resubscriptions:** Avoid rapid subscribe/unsubscribe cycles  
+5. **Global Connection Status:** Show "Connecting..." UI during reconnection  
+
+---  
+
+## 7. Type Reference  
+
+Complete GraphQL type definitions with field descriptions.  
+
+### User Types  
+
+#### User  
+```graphql  
+type User {  
+  id: ID!              # Unique user identifier  
+  username: String!    # User's display name (alphanumeric + underscore)  
+  lastOnline: DateTime # Last activity timestamp (for online status)  
+}  
+```  
+
+#### AuthResponse  
+```graphql  
+type AuthResponse {  
+  success: Boolean!    # Operation succeeded  
+  message: String!     # Human-readable result message  
+  user: User           # User object (null on failure)  
+}  
+```  
+
+#### LogoutResponse  
+```graphql  
+type LogoutResponse {  
+  success: Boolean!    # Always true (idempotent)  
+  message: String!     # Confirmation message  
+}  
+```  
+
+#### ProtectedDataResponse  
+```graphql  
+type ProtectedDataResponse {  
+  message: String!     # Welcome message  
+  user: User!          # Authenticated user  
+  timestamp: String!   # Query execution timestamp (ISO 8601)  
+}  
+```  
+
+---  
+
+### Friend Types  
+
+#### FriendRequest  
+```graphql  
+type FriendRequest {  
+  id: ID!              # Request ID (MongoDB ObjectId)  
+  fromUserId: ID!      # Sender's user ID  
+  toUserId: ID!        # Recipient's user ID  
+  fromUser: User       # Sender user object (nested)  
+  toUser: User         # Recipient user object (nested)  
+  createdAt: String!   # Request creation timestamp (ISO 8601)  
+}  
+```  
+
+#### Friendship  
+```graphql  
+type Friendship {  
+  friendId: ID!        # Friend's user ID  
+  friend: User         # Friend user object (nested)  
+  createdAt: String!   # Friendship creation timestamp (ISO 8601)  
+}  
+```  
+
+#### FriendRequestResponse  
+```graphql  
+type FriendRequestResponse {  
+  success: Boolean!           # Operation succeeded  
+  message: String!            # Result message  
+  request: FriendRequest      # Created request (null on failure)  
+}  
+```  
+
+#### FriendActionResponse  
+```graphql  
+type FriendActionResponse {  
+  success: Boolean!    # Operation succeeded  
+  message: String!     # Result message  
+}  
+```  
+
+#### FriendListResponse  
+```graphql  
+type FriendListResponse {  
+  friends: [Friendship!]!   # Array of friendships (empty if no friends)  
+}  
+```  
+
+#### FriendRequestListResponse  
+```graphql  
+type FriendRequestListResponse {  
+  sent: [FriendRequest!]!      # Requests sent by user  
+  received: [FriendRequest!]!  # Requests received by user  
+}  
+```  
+
+#### FriendshipCheckResponse  
+```graphql  
+type FriendshipCheckResponse {  
+  areFriends: Boolean!   # Friendship exists  
+  userId1: ID!           # First user ID (from input)  
+  userId2: ID!           # Second user ID (from input)  
+}  
+```  
+
+---  
+
+### Messaging Types  
+
+#### Conversation  
+```graphql  
+type Conversation {  
+  id: ID!                      # Conversation ID (MongoDB ObjectId)  
+  participantIds: [String!]!   # Array of 2 user IDs (sorted)  
+  lastMessage: LastMessagePreview  # Most recent message preview  
+  readStatus: JSON             # Map of userId → timestamp  
+  createdAt: DateTime!         # Conversation creation time  
+}  
+```  
+
+#### LastMessagePreview  
+```graphql  
+type LastMessagePreview {  
+  senderId: String!    # Message sender ID  
+  text: String!        # Message content preview (max 100 chars)  
+  timeSent: DateTime!  # Message timestamp  
+}  
+```  
+
+#### Message  
+```graphql  
+type Message {  
+  id: ID!                  # Message ID (MongoDB ObjectId)  
+  conversationId: ID!      # Parent conversation ID  
+  senderId: String!        # Sender user ID  
+  recipientId: String!     # Recipient user ID  
+  content: String          # Message text (null if unsent)  
+  timeSent: DateTime!      # Send timestamp  
+  meta: MessageMeta!       # Message metadata  
+  reactions: [Reaction!]!  # Array of reactions (empty if none)  
+  repliedMessage: Message  # Original message if reply (nested)  
+}  
+```  
+
+#### MessageMeta  
+```graphql  
+type MessageMeta {  
+  isUnsent: Boolean!       # Message was unsent by sender  
+  isForwarded: Boolean!    # Message was forwarded from another conversation  
+  replyTo: ID              # ID of message being replied to (null if not reply)  
+  lastEditAt: DateTime     # Timestamp of last edit (null if never edited)  
+}  
+```  
+
+#### Reaction  
+```graphql  
+type Reaction {  
+  userId: String!    # User who reacted  
+  type: Int!         # Reaction type (1-6)  
+}  
+```  
+
+**Reaction Type Mappings:**  
+- `1` = 👍 (Thumbs Up)  
+- `2` = ❤️ (Heart)  
+- `3` = 😂 (Laugh)  
+- `4` = 😮 (Wow)  
+- `5` = 😢 (Sad)  
+- `6` = 😡 (Angry)  
+
+#### MessageConnection  
+```graphql  
+type MessageConnection {  
+  edges: [MessageEdge!]!   # Array of message edges  
+  pageInfo: PageInfo!      # Pagination info  
+}  
+```  
+
+#### MessageEdge  
+```graphql  
+type MessageEdge {  
+  cursor: String!    # Base64-encoded timestamp cursor  
+  node: Message!     # Message object  
+}  
+```  
+
+#### PageInfo  
+```graphql  
+type PageInfo {  
+  hasNextPage: Boolean!  # More messages available before endCursor  
+  endCursor: String      # Cursor for next page (null if no more pages)  
+}  
+```  
+
+#### ReadReceipt  
+```graphql  
+type ReadReceipt {  
+  conversationId: ID!  # Conversation ID  
+  userId: String!      # User who marked as read  
+  timestamp: DateTime! # Read timestamp  
+}  
+```  
+
+#### ReadStatusMap  
+```graphql  
+type ReadStatusMap {  
+  conversationId: ID!  # Conversation ID  
+  status: JSON!        # Map of userId → timestamp  
+}  
+```  
+
+#### LastOnlineStatus  
+```graphql  
+type LastOnlineStatus {  
+  userId: String!      # User ID  
+  lastOnline: DateTime!  # Last activity timestamp  
+  isOnline: Boolean!   # Online if lastOnline within 2 minutes  
+}  
+```  
+
+#### TypingStatus  
+```graphql  
+type TypingStatus {  
+  conversationId: ID!  # Conversation ID  
+  userId: String!      # User who is typing  
+  isTyping: Boolean!   # Currently typing  
+}  
+```  
+
+#### ReactionUpdate  
+```graphql  
+type ReactionUpdate {  
+  messageId: ID!           # Message that was reacted to  
+  reactions: [Reaction!]!  # Updated reactions array  
+}  
+```  
+
+---  
+
+### Call Types  
+
+#### Call  
+```graphql  
+type Call {  
+  id: ID!                  # Call ID (UUID)  
+  participantIds: [String!]!  # Array of 2 user IDs [initiator, recipient]  
+  type: CallType!          # Call type (voice/video/screen)  
+  status: CallStatus!      # Current call status  
+  startTime: DateTime!     # Call initiation timestamp  
+}  
+```  
+
+#### CallType (Enum)  
+```graphql  
+enum CallType {  
+  voice   # Audio-only call  
+  video   # Audio + video call  
+  screen  # Screen sharing call  
+}  
+```  
+
+#### CallStatus (Enum)  
+```graphql  
+enum CallStatus {  
+  initiating  # Call being created (brief state)  
+  ringing     # Waiting for recipient to answer  
+  active      # Call in progress (answered)  
+  ended       # Call ended normally  
+  missed      # Call not answered  
+  rejected    # Call explicitly rejected  
+}  
+```  
+
+#### STUNConfiguration  
+```graphql  
+type STUNConfiguration {  
+  urls: [String!]!   # Array of STUN server URLs  
+}  
+```  
+
+**Example:**  
+```json  
+{  
+  "urls": [  
+    "stun:stun.l.google.com:19302",  
+    "stun:stun1.l.google.com:19302"  
+  ]  
+}  
+```  
+
+#### CallInitiationResponse  
+```graphql  
+type CallInitiationResponse {  
+  success: Boolean!             # Operation succeeded  
+  message: String!              # Result message  
+  call: Call                    # Call object (null on failure)  
+  stunServers: STUNConfiguration  # STUN servers for WebRTC (null on failure)  
+}  
+```  
+
+#### CallSignal  
+```graphql  
+type CallSignal {  
+  callId: ID!      # Call ID  
+  senderId: String!  # User who sent signal  
+  type: String!    # Signal type: "offer", "answer", "ice-candidate"  
+  payload: JSON!   # Signal payload (SDP or ICE candidate)  
+}  
+```  
+
+**Signal Payload Examples:**  
+
+**Offer/Answer:**  
+```json  
+{  
+  "type": "offer",  
+  "sdp": "v=0\r\no=- 1234567890 2 IN IP4 127.0.0.1\r\n..."  
+}  
+```  
+
+**ICE Candidate:**  
+```json  
+{  
+  "candidate": "candidate:842163049 1 udp 1677729535 203.0.113.45 54321 typ srflx",  
+  "sdpMLineIndex": 0,  
+  "sdpMid": "0"  
+}  
+```  
+
+#### CallStateChange  
+```graphql  
+type CallStateChange {  
+  callId: ID!          # Call ID  
+  status: CallStatus!  # New status  
+  timestamp: DateTime! # State change timestamp  
+}  
+```  
+
+#### IncomingCallNotification  
+```graphql  
+type IncomingCallNotification {  
+  call: Call!    # Call object  
+  caller: User!  # User initiating call  
+}  
+```  
+
+---  
+
+### Custom Scalars  
+
+#### DateTime  
+```graphql  
+scalar DateTime  
+```  
+
+**Format:** ISO 8601 string (`YYYY-MM-DDTHH:mm:ss.sssZ`)  
+
+**Example:** `"2024-01-15T14:30:00.000Z"`  
+
+**Serialization:** JavaScript `Date` objects convert to ISO strings  
+
+**Parsing:** ISO strings convert to `Date` objects  
+
+**Usage:**  
+```javascript  
+// Sending to server  
+const variables = {  
+  timestamp: new Date().toISOString()  
+};  
+
+// Receiving from server  
+const message = data.sendMessage;  
+const date = new Date(message.timeSent);  
+console.log(date.toLocaleString());  // "1/15/2024, 2:30:00 PM"  
+```  
+
+#### JSON  
+```graphql  
+scalar JSON  
+```  
+
+**Format:** Any valid JSON value (object, array, primitive)  
+
+**Examples:**  
+```json  
+// Object  
+{ "key": "value", "nested": { "data": 123 } }  
+
+// Array  
+["item1", "item2", 123, true]  
+
+// Primitive  
+"string"  
+42  
+true  
+null  
+```  
+
+**Usage:**  
+- SDP payloads  
+- ICE candidates  
+- Read status maps  
+- Arbitrary metadata  
+
+---  
+
+## 8. Error Handling Guide  
+
+### Error Response Structure  
+
+GraphQL errors follow this format:  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Human-readable error message",  
+      "locations": [{ "line": 2, "column": 3 }],  
+      "path": ["mutationName", "fieldName"],  
+      "extensions": {  
+        "code": "ERROR_CODE"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Key Fields:**  
+- `message`: Error description  
+- `extensions.code`: Machine-readable error code  
+- `path`: GraphQL path where error occurred  
+- `data`: `null` for errors, or partial data if some fields succeeded  
+
+---  
+
+### Extension Codes and Meanings  
+
+#### UNAUTHENTICATED  
+
+**Meaning:** No valid session exists  
+
+**Common Causes:**  
+- Accessing protected resolver without logging in  
+- Session expired (exceeded TTL)  
+- Session cookie not sent (`credentials: 'include'` missing)  
+- Session destroyed via logout  
+
+**Example:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Not authenticated",  
+      "extensions": {  
+        "code": "UNAUTHENTICATED"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+if (error.graphQLErrors.some(e => e.extensions?.code === 'UNAUTHENTICATED')) {  
+  // Redirect to login  
+  window.location.href = '/login';  
+}  
+```  
+
+---  
+
+#### FORBIDDEN  
+
+**Meaning:** Authenticated but lacking permission  
+
+**Common Causes:**  
+- Accessing resources you don't own (other user's messages)  
+- Not a conversation participant  
+- Trying to accept someone else's friend request  
+- Answering call you're not recipient of  
+
+**Example:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "You are not a participant in this conversation",  
+      "extensions": {  
+        "code": "FORBIDDEN"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+if (error.graphQLErrors.some(e => e.extensions?.code === 'FORBIDDEN')) {  
+  // Show error message  
+  showNotification('You do not have permission to perform this action', 'error');  
+}  
+```  
+
+---  
+
+#### BAD_REQUEST  
+
+**Meaning:** Input validation failure  
+
+**Common Causes:**  
+- Empty message content  
+- Username too short (<3 chars)  
+- Invalid character in username  
+- Malformed MongoDB ObjectId  
+- Invalid cursor format  
+- Reaction type out of range (not 1-6)  
+- Message content exceeds 5000 characters  
+
+**Examples:**  
+
+**Empty Content:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Message content cannot be empty",  
+      "extensions": {  
+        "code": "BAD_REQUEST"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Invalid ID:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Invalid conversation ID format",  
+      "extensions": {  
+        "code": "BAD_REQUEST"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+if (error.graphQLErrors.some(e => e.extensions?.code === 'BAD_REQUEST')) {  
+  // Show validation error to user  
+  const message = error.graphQLErrors[0].message;  
+  showFieldError(fieldName, message);  
+}  
+```  
+
+---  
+
+#### NOT_FOUND  
+
+**Meaning:** Resource doesn't exist in database  
+
+**Common Causes:**  
+- Conversation ID doesn't exist  
+- Message ID not found  
+- Friend request ID invalid  
+- Call ID expired/deleted  
+- User ID doesn't exist  
+
+**Example:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Conversation not found",  
+      "extensions": {  
+        "code": "NOT_FOUND"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+if (error.graphQLErrors.some(e => e.extensions?.code === 'NOT_FOUND')) {  
+  // Resource was deleted—remove from UI  
+  removeConversationFromList(conversationId);  
+  showNotification('Conversation no longer exists', 'info');  
+}  
+```  
+
+---  
+
+#### INTERNAL_SERVER_ERROR  
+
+**Meaning:** Unexpected server failure  
+
+**Common Causes:**  
+- Database connection lost  
+- Redis unavailable  
+- Unhandled exception in resolver  
+- MongoDB query failure  
+
+**Example (Development):**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Failed to fetch messages",  
+      "extensions": {  
+        "code": "INTERNAL_SERVER_ERROR"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Example (Production):**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "An unexpected internal error occurred.",  
+      "extensions": {  
+        "code": "INTERNAL_SERVER_ERROR"  
+      }  
+    }  
+  ],  
+  "data": null  
+}  
+```  
+
+**Frontend Handling:**  
+```javascript  
+if (error.graphQLErrors.some(e => e.extensions?.code === 'INTERNAL_SERVER_ERROR')) {  
+  // Show generic error—don't expose internals  
+  showNotification('Something went wrong. Please try again later.', 'error');  
+  
+  // Optionally retry  
+  setTimeout(() => retryOperation(), 3000);  
+}  
+```  
+
+---  
+
+### Common Error Scenarios by Feature  
+
+#### Authentication Errors  
+
+**Login Failed:**  
+```json  
+{  
+  "data": {  
+    "login": {  
+      "success": false,  
+      "message": "Invalid credentials",  
+      "user": null  
+    }  
+  }  
+}  
+```  
+*Note: Login errors return in `data` field, not `errors` array.*  
+
+**Session Expired:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Not authenticated",  
+      "extensions": { "code": "UNAUTHENTICATED" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### Friend Management Errors  
+
+**Cannot Friend Yourself:**  
+```json  
+{  
+  "data": {  
+    "sendFriendRequest": {  
+      "success": false,  
+      "message": "Cannot send friend request to yourself",  
+      "request": null  
+    }  
+  }  
+}  
+```  
+
+**Not Authorized to Accept:**  
+```json  
+{  
+  "data": {  
+    "acceptFriendRequest": {  
+      "success": false,  
+      "message": "You can only accept requests sent to you"  
+    }  
+  }  
+}  
+```  
+
+---  
+
+#### Messaging Errors  
+
+**Not Participant:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "You are not a participant in this conversation",  
+      "extensions": { "code": "FORBIDDEN" }  
+    }  
+  ]  
+}  
+```  
+
+**Cannot Reply to Unsent:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Cannot reply to unsent message",  
+      "extensions": { "code": "BAD_REQUEST" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+#### Call Errors  
+
+**Not Friends:**  
+```json  
+{  
+  "data": {  
+    "initiateCall": {  
+      "success": false,  
+      "message": "You can only call friends",  
+      "call": null,  
+      "stunServers": null  
+    }  
+  }  
+}  
+```  
+
+**Call Expired:**  
+```json  
+{  
+  "errors": [  
+    {  
+      "message": "Call not found",  
+      "extensions": { "code": "NOT_FOUND" }  
+    }  
+  ]  
+}  
+```  
+
+---  
+
+### Global Error Handler Pattern  
+
+```javascript  
+function handleGraphQLError(error) {  
+  // Network error (server unreachable)  
+  if (error.networkError) {  
+    showNotification('Unable to connect to server. Check your connection.', 'error');  
+    return;  
+  }  
+
+  // GraphQL errors  
+  if (error.graphQLErrors && error.graphQLErrors.length > 0) {  
+    error.graphQLErrors.forEach(err => {  
+      const code = err.extensions?.code;  
+      const message = err.message;  
+
+      switch (code) {  
+        case 'UNAUTHENTICATED':  
+          // Redirect to login  
+          localStorage.clear();  
+          window.location.href = '/login';  
+          break;  
+
+        case 'FORBIDDEN':  
+          showNotification(`Permission denied: ${message}`, 'error');  
+          break;  
+
+        case 'BAD_REQUEST':  
+          showNotification(`Invalid input: ${message}`, 'warning');  
+          break;  
+
+        case 'NOT_FOUND':  
+          showNotification(`Not found: ${message}`, 'info');  
+          break;  
+
+        case 'INTERNAL_SERVER_ERROR':  
+          showNotification('Server error. Please try again later.', 'error');  
+          logErrorToMonitoring(err);  // Send to error tracking service  
+          break;  
+
+        default:  
+          showNotification(message, 'error');  
+      }  
+    });  
+  }  
+}  
+
+// Apollo Client usage  
+const client = new ApolloClient({  
+  // ...  
+  onError: handleGraphQLError,  
+});  
+```  
+
+---  
+
+## 9. Complete Feature Checklist  
+
+Use this checklist to track implementation progress.  
+
+### Authentication ✅  
+- [ ] User registration with validation  
+  - [ ] Username length check (min 3 chars)  
+  - [ ] Username character validation (alphanumeric + underscore)  
+  - [ ] Password length check (min 8 chars)  
+  - [ ] Duplicate username handling  
+- [ ] User login with session creation  
+  - [ ] Credential validation  
+  - [ ] Session cookie setting  
+  - [ ] Error handling for invalid credentials  
+- [ ] User logout with session destruction  
+  - [ ] Session deletion from Redis  
+  - [ ] Cookie clearing  
+  - [ ] Redirect to login page  
+- [ ] Retrieve current user info  
+  - [ ] Session validation  
+  - [ ] User data fetching  
+  - [ ] Handle session expiration  
+
+### Friend Management 🤝  
+- [ ] Send friend request  
+  - [ ] Validate not sending to self  
+  - [ ] Check target user exists  
+  - [ ] Prevent duplicate requests  
+  - [ ] Check not already friends  
+- [ ] Accept friend request  
+  - [ ] Validate user is recipient  
+  - [ ] Create bidirectional friendship  
+  - [ ] Delete request after acceptance  
+- [ ] Refuse friend request  
+  - [ ] Validate user is recipient  
+  - [ ] Delete request  
+- [ ] Remove friend  
+  - [ ] Validate friendship exists  
+  - [ ] Delete bidirectional entries  
+- [ ] View my friends list  
+  - [ ] Load friendships from database  
+  - [ ] Display friend user objects  
+- [ ] View another user's friends  
+  - [ ] Public query (no auth required)  
+  - [ ] Handle user not found  
+- [ ] Check friendship status  
+  - [ ] Validate both user IDs  
+  - [ ] Return boolean result  
+- [ ] View friend requests (sent/received)  
+  - [ ] Separate sent and received lists  
+  - [ ] Load user objects for both parties  
+
+### Messaging 💬  
+- [ ] Create conversation  
+  - [ ] Validate participant exists  
+  - [ ] Prevent self-conversation  
+  - [ ] Return existing conversation if found  
+- [ ] Send message  
+  - [ ] Content validation (1-5000 chars)  
+  - [ ] Conversation participant check  
+  - [ ] Update conversation lastMessage  
+  - [ ] Trigger subscription  
+- [ ] Fetch message history with pagination  
+  - [ ] Cursor-based pagination  
+  - [ ] Handle invalid cursors  
+  - [ ] Return messages in descending order  
+  - [ ] Calculate hasNextPage  
+- [ ] Reply to message  
+  - [ ] Validate original message exists  
+  - [ ] Prevent reply to unsent message  
+  - [ ] Set meta.replyTo field  
+  - [ ] Load repliedMessage via DataLoader  
+- [ ] Edit message  
+  - [ ] Validate user is sender  
+  - [ ] Prevent editing unsent message  
+  - [ ] Set meta.lastEditAt timestamp  
+  - [ ] Update conversation lastMessage if needed  
+  - [ ] Trigger messageUpdated subscription  
+- [ ] Unsend message  
+  - [ ] Validate user is sender  
+  - [ ] Set meta.isUnsent flag  
+  - [ ] Return null content  
+  - [ ] Update conversation lastMessage to previous  
+  - [ ] Trigger messageUpdated subscription  
+- [ ] Forward message  
+  - [ ] Validate participant in source conversation  
+  - [ ] Validate participant in target conversation  
+  - [ ] Prevent forwarding unsent messages  
+  - [ ] Set meta.isForwarded flag  
+  - [ ] Trigger subscription in target conversation  
+- [ ] Add reaction to message  
+  - [ ] Validate reaction type (1-6)  
+  - [ ] Replace existing user reaction  
+  - [ ] Trigger reactionUpdated subscription  
+- [ ] Remove reaction from message  
+  - [ ] Remove user's reaction  
+  - [ ] Trigger reactionUpdated subscription  
+- [ ] Mark conversation as read  
+  - [ ] Update readStatus map  
+  - [ ] Trigger readStatusChanged subscription (to other user only)  
+- [ ] Get read status  
+  - [ ] Return readStatus map for conversation  
+  - [ ] Validate user is participant  
+- [ ] Update last online timestamp  
+  - [ ] Rate limit to 60 seconds  
+  - [ ] Update database  
+  - [ ] Cache in Redis  
+- [ ] Get user's last online status  
+  - [ ] Validate shared conversation exists  
+  - [ ] Calculate isOnline (within 2 minutes)  
+- [ ] Send typing indicator  
+  - [ ] Validate conversation participant  
+  - [ ] Trigger typingIndicator subscription (to other user only)
+  - [ ] No persistence (ephemeral state)  
+
+#### Subscriptions  
+- [ ] Subscribe to new messages  
+  - [ ] Filter by conversation participant  
+  - [ ] Handle messageReceived events  
+  - [ ] Update UI with new messages  
+- [ ] Subscribe to message updates  
+  - [ ] Handle edit events (show "Edited" badge)  
+  - [ ] Handle unsend events (replace with null content)  
+  - [ ] Update existing messages in UI  
+- [ ] Subscribe to reaction updates  
+  - [ ] Receive messageId and reactions array  
+  - [ ] Update reaction counts/displays  
+- [ ] Subscribe to read receipts  
+  - [ ] Filter out own read receipts  
+  - [ ] Update "Read" indicators for messages  
+  - [ ] Compare timestamps with message times  
+- [ ] Subscribe to typing indicators  
+  - [ ] Filter out own typing events  
+  - [ ] Show/hide "User is typing..." indicator  
+  - [ ] Auto-hide after timeout  
+
+### WebRTC Calling 📞  
+- [ ] Initiate call (voice/video/screen)  
+  - [ ] Validate friendship exists  
+  - [ ] Create RTCPeerConnection with STUN servers  
+  - [ ] Handle call rejection before answer  
+  - [ ] Store callId in local state  
+- [ ] Answer call  
+  - [ ] Validate user is recipient  
+  - [ ] Create RTCPeerConnection  
+  - [ ] Set up media streams  
+  - [ ] Transition to active state  
+- [ ] Reject call  
+  - [ ] Available to both participants  
+  - [ ] Clean up UI state  
+  - [ ] Stop ringtone  
+- [ ] End call  
+  - [ ] Close peer connection  
+  - [ ] Stop media streams  
+  - [ ] Calculate and display duration  
+  - [ ] Save to call history  
+- [ ] Send SDP offer  
+  - [ ] Create offer from peer connection  
+  - [ ] Set local description  
+  - [ ] Send via mutation  
+- [ ] Send SDP answer  
+  - [ ] Receive offer from subscription  
+  - [ ] Create answer from peer connection  
+  - [ ] Set local description  
+  - [ ] Send via mutation  
+- [ ] Send ICE candidate  
+  - [ ] Handle icecandidate events  
+  - [ ] Send each candidate as discovered (trickle ICE)  
+  - [ ] Continue until gathering complete  
+
+#### Subscriptions  
+- [ ] Subscribe to incoming calls  
+  - [ ] Global subscription (always active when logged in)  
+  - [ ] Show call notification UI  
+  - [ ] Play ringtone  
+  - [ ] Provide accept/reject options  
+- [ ] Subscribe to call signals  
+  - [ ] Filtered by callId  
+  - [ ] Handle SDP offers/answers  
+  - [ ] Handle ICE candidates  
+  - [ ] Route signals to peer connection  
+- [ ] Subscribe to call state changes  
+  - [ ] Handle state transitions (ringing → active → ended)  
+  - [ ] Update call UI based on state  
+  - [ ] Clean up on ended/rejected/missed  
+
+---  
+
+## Implementation Priority Guide  
+
+For frontend developers implementing features, recommended order:  
+
+### Phase 1: Core Authentication & User Management  
+1. Login/Registration/Logout  
+2. Session persistence and validation  
+3. Current user query (`me`)  
+
+### Phase 2: Friend System  
+1. Send/accept/refuse friend requests  
+2. View friends list  
+3. Check friendship status  
+4. Remove friends  
+
+### Phase 3: Basic Messaging  
+1. Create conversation  
+2. Send message  
+3. Fetch messages with pagination  
+4. Subscribe to new messages (`messageReceived`)  
+
+### Phase 4: Advanced Messaging Features  
+1. Reply to messages  
+2. Edit messages  
+3. Unsend messages  
+4. Message reactions (add/remove)  
+5. Subscribe to message updates and reactions  
+6. Read receipts (mark as read, subscribe to changes)  
+7. Typing indicators (send, subscribe)  
+8. Forward messages  
+
+### Phase 5: WebRTC Calling  
+1. Initiate call (voice/video)  
+2. Answer/reject call  
+3. Subscribe to incoming calls  
+4. SDP offer/answer exchange  
+5. ICE candidate exchange  
+6. Subscribe to call signals and state changes  
+7. End call with duration tracking  
+8. Screen sharing calls  
+
+---  
+
+## Quick Reference: Common Queries & Mutations  
+
+### Authentication Flow  
+```graphql  
+# 1. Register  
+mutation { register(username: "alice", password: "password123") { success message user { id username } } }  
+
+# 2. Login  
+mutation { login(username: "alice", password: "password123") { success message user { id username } } }  
+
+# 3. Verify session  
+query { me { user { id username } timestamp } }  
+
+# 4. Logout  
+mutation { logout { success message } }  
+```  
+
+### Friend Management Flow  
+```graphql  
+# Send request  
+mutation { sendFriendRequest(toUserId: "456") { success message request { id } } }  
+
+# Accept request  
+mutation { acceptFriendRequest(requestId: "req123") { success message } }  
+
+# View friends  
+query { myFriends { friends { friendId friend { id username } createdAt } } }  
+```  
+
+### Messaging Flow  
+```graphql  
+# Create conversation  
+mutation { createConversation(participantId: "456") { id participantIds createdAt } }  
+
+# Send message  
+mutation { sendMessage(conversationId: "conv123", content: "Hello!") { id content timeSent } }  
+
+# Fetch messages (initial load)  
+query { fetchMessages(conversationId: "conv123", limit: 20) { edges { node { id content timeSent } cursor } pageInfo { hasNextPage endCursor } } }  
+
+# Fetch more messages (pagination)  
+query { fetchMessages(conversationId: "conv123", cursor: "BASE64_CURSOR", limit: 20) { edges { node { id content } } pageInfo { hasNextPage endCursor } } }  
+```  
+
+### Call Flow  
+```graphql  
+# Initiate call  
+mutation { initiateCall(recipientId: "456", callType: video) { success call { id participantIds type status startTime } stunServers { urls } } }  
+
+# Answer call  
+mutation { answerCall(callId: "call-uuid-123") { success call { id status } stunServers { urls } } }  
+
+# Send SDP offer  
+mutation { sendSDPOffer(callId: "call-uuid-123", sdp: { type: "offer", sdp: "..." }) }  
+
+# Send ICE candidate  
+mutation { sendICECandidate(callId: "call-uuid-123", candidate: { candidate: "...", sdpMLineIndex: 0, sdpMid: "0" }) }  
+
+# End call  
+mutation { endCall(callId: "call-uuid-123") }  
+```  
+
+---  
+
+## WebSocket Subscription Examples  
+
+### Message Subscriptions  
+```graphql  
+# New messages  
+subscription { messageReceived(conversationId: "conv123") { id senderId content timeSent } }  
+
+# Message updates (edits/unsends)  
+subscription { messageUpdated(conversationId: "conv123") { id content meta { isUnsent lastEditAt } } }  
+
+# Reactions  
+subscription { reactionUpdated(conversationId: "conv123") { messageId reactions { userId type } } }  
+
+# Read receipts  
+subscription { readStatusChanged(conversationId: "conv123") { conversationId userId timestamp } }  
+
+# Typing indicators  
+subscription { typingIndicator(conversationId: "conv123") { conversationId userId isTyping } }  
+```  
+
+### Call Subscriptions  
+```graphql  
+# Incoming calls (global)  
+subscription { incomingCall { call { id type status startTime } caller { id username } } }  
+
+# Call signals (per call)  
+subscription { callSignal(callId: "call-uuid-123") { senderId type payload } }  
+
+# Call state changes  
+subscription { callStateChanged(callId: "call-uuid-123") { callId status timestamp } }  
+```  
+
+---  
+
+## Performance Optimization Tips  
+
+### 1. Message Pagination  
+- Start with `limit: 20` for initial load  
+- Increase to `limit: 50` for "Load More" actions  
+- Cache cursors to avoid re-fetching same messages  
+- Implement virtual scrolling for large conversations  
+
+### 2. Subscription Management  
+- Subscribe only to active conversation  
+- Unsubscribe when navigating away  
+- Use single WebSocket connection for all subscriptions  
+- Debounce typing indicator sends (300ms recommended)  
+
+### 3. DataLoader Benefits  
+- `repliedMessage` field uses DataLoader (batches queries)  
+- Fetch multiple messages with replies in single query  
+- No N+1 problem when loading conversation history  
+
+### 4. Rate Limiting Awareness  
+- `updateLastOnline`: 60-second throttle  
+- Call `setTyping(false)` after 3 seconds of inactivity  
+- Batch read receipts (mark as read once per conversation view)  
+
+### 5. Caching Strategy  
+```javascript  
+// Apollo Client cache configuration  
+const cache = new InMemoryCache({  
+  typePolicies: {  
+    Query: {  
+      fields: {  
+        fetchMessages: {  
+          keyArgs: ['conversationId'],  
+          merge(existing = { edges: [] }, incoming) {  
+            return {  
+              ...incoming,  
+              edges: [...existing.edges, ...incoming.edges]  
+            };  
+          }  
+        }  
+      }  
+    },  
+    Message: {  
+      fields: {  
+        reactions: {  
+          merge: false // Replace, don't merge  
+        }  
+      }  
+    }  
+  }  
+});  
+```  
+
+---  
+
+## Security Considerations  
+
+### 1. Cookie Handling  
+- Always use `credentials: 'include'` for HTTP requests  
+- Ensure `sameSite: 'lax'` is set on cookies (server-side)  
+- Use HTTPS in production for secure cookies  
+
+### 2. Input Validation  
+- Sanitize user input before sending (strip HTML, check length)  
+- Validate IDs are valid formats before mutations  
+- Handle long messages (5000 char limit server-side)  
+
+### 3. Error Exposure  
+- Production errors sanitized (`INTERNAL_SERVER_ERROR` details hidden)  
+- Log errors to monitoring service (Sentry, LogRocket, etc.)  
+- Don't display raw error messages to users  
+
+### 4. WebRTC Security  
+- STUN servers are public (Google's servers provided)  
+- For production, add TURN servers for NAT traversal  
+- Validate all signaling messages  
+- Implement call encryption (DTLS-SRTP enabled by default in WebRTC)  
+
+---  
+
+## Testing Checklist  
+
+### Unit Tests  
+- [ ] Validate username/password requirements  
+- [ ] Test message content trimming and length validation  
+- [ ] Test cursor encoding/decoding  
+- [ ] Test reaction type validation (1-6 range)  
+- [ ] Test pagination logic (hasNextPage calculation)  
+
+### Integration Tests  
+- [ ] Complete authentication flow (register → login → logout)  
+- [ ] Friend request lifecycle (send → accept → view friends → remove)  
+- [ ] Message lifecycle (send → edit → unsend)  
+- [ ] Reply chain loading (test DataLoader batching)  
+- [ ] Reaction updates via subscription  
+- [ ] WebRTC signaling flow (offer → answer → ICE candidates)  
+
+### End-to-End Tests  
+- [ ] Multi-user messaging scenario  
+- [ ] Concurrent reactions from multiple users  
+- [ ] Call rejection/missed call flows  
+- [ ] Subscription reconnection after network interruption  
+- [ ] Session expiration handling  
+
+---  
+
+## Troubleshooting Guide  
+
+### Common Issues  
+
+**Issue: Cookies not being sent**  
+```javascript  
+// ❌ Wrong  
+fetch('/graphql', { body: query })  
+
+// ✅ Correct  
+fetch('/graphql', {   
+  credentials: 'include',  // Critical!  
+  body: query   
+})  
+```  
+
+**Issue: Subscription not receiving events**  
+- Check user is conversation participant  
+- Verify WebSocket connection is established  
+- Check browser console for connection errors  
+- Ensure subscription variables match mutation variables (same conversationId)  
+
+**Issue: Messages not loading past first page**  
+- Validate cursor is base64-encoded ISO 8601 string  
+- Check `hasNextPage` is true before requesting more  
+- Ensure `endCursor` is passed to next query  
+
+**Issue: Call not connecting**  
+- Verify both users are friends  
+- Check STUN server connectivity (test with STUN checker tool)  
+- Ensure ICE candidates are being exchanged  
+- Check firewall/NAT settings (may need TURN servers)  
+
+**Issue: "UNAUTHENTICATED" error after some time**  
+- Session expired (default 7 days)  
+- Redirect to login and clear local state  
+- Implement token refresh logic if needed  
+
+---  
+
+## API Rate Limits (Current Implementation)  
+
+| Operation | Limit | Window | Notes |  
+|-----------|-------|--------|-------|  
+| `updateLastOnline` | 1 request | 60 seconds | Redis-cached |  
+| All other operations | None | N/A | No explicit rate limiting |  
+
+**Note:** Consider implementing rate limiting for production:  
+- Login attempts: 5 per 15 minutes per IP  
+- Message sending: 30 per minute per user  
+- Friend requests: 10 per hour per user  
+
+---  
+
+## Deployment Considerations  
+
+### Environment Variables Required  
+```bash  
+# Server  
+PORT=4000  
+NODE_ENV=production  
+
+# Redis  
+REDIS_HOST=redis.example.com  
+REDIS_PORT=6379  
+
+# Session  
+SESSION_SECRET=your-secret-key-here  
+SESSION_MAX_AGE=604800000  # 7 days in ms  
+
+# CORS  
+FRONTEND_URL=https://app.example.com  
+```  
+
+### Health Check Endpoint  
+```bash  
+curl http://localhost:4000/health  
+```  
+
+**Response:**  
+```json  
+{  
+  "status": "ok",  
+  "timestamp": "2024-01-15T14:30:00.000Z",  
+  "uptime": 123456,  
+  "redis": "connected",  
+  "mongodb": "connected",  
+  "pubsub": "initialized"  
+}  
+```  
+
+### Monitoring Recommendations  
+- Track subscription connection count  
+- Monitor Redis memory usage (session + call state)  
+- Alert on MongoDB connection drops  
+- Log authentication failures  
+- Track WebRTC connection success rate  
+
+---  
+
+## Additional Resources  
+
+### GraphQL Clients  
+- [Apollo Client Documentation](https://www.apollographql.com/docs/react/)  
+- [urql Documentation](https://formidable.com/open-source/urql/docs/)  
+- [graphql-ws Library](https://github.com/enisdenjo/graphql-ws)  
+
+### WebRTC Resources  
+- [MDN WebRTC API](https://developer.mozilla.org/en-US/docs/Web/API/WebRTC_API)  
+- [WebRTC Samples](https://webrtc.github.io/samples/)  
+- [STUN/TURN Server Setup](https://www.twilio.com/docs/stun-turn)  
+
+### Testing Tools  
+- [GraphQL Playground](http://localhost:4000/graphql) (built-in)  
+- [Postman GraphQL Support](https://learning.postman.com/docs/sending-requests/graphql/graphql-overview/)  
+- [WebRTC Troubleshooter](https://test.webrtc.org/)  
+
+---  
+
+## Support & Feedback  
+
+For questions or issues with this API:  
+1. Check error codes in GraphQL responses  
+2. Review troubleshooting section above  
+3. Test with GraphQL Playground at `/graphql`  
+4. Verify health check endpoint shows all services connected  
+5. Check browser console for client-side errors  
+
+---  
+
+**Document Version:** 1.0  
+**Last Updated:** 2026-02-06  
+**API Version:** Compatible with backend commit as of provided code snapshot  
+
+---  
+
+## Summary of Key Points  
+
+1. **Authentication:** Session-based with HTTP-only cookies, `credentials: 'include'` required  
+2. **Pagination:** Cursor-based using base64-encoded ISO 8601 timestamps  
+3. **Real-time:** WebSocket subscriptions with automatic reconnection  
+4. **WebRTC:** Signaling via GraphQL, media via P2P with STUN servers  
+5. **Error Handling:** Standardized codes (UNAUTHENTICATED, FORBIDDEN, BAD_REQUEST, NOT_FOUND, INTERNAL_SERVER_ERROR)  
+6. **Authorization:** Conversation participants, friend relationships, message ownership  
+7. **Rate Limiting:** 60-second throttle on `updateLastOnline`  
+8. **Data Storage:** Redis (sessions, calls), PostgreSQL (users, friends), MongoDB (messages, conversations)  
+
+This documentation provides everything needed to implement a fully-functional real-time messaging and calling frontend without examining backend code. All operations, types, errors, and patterns are comprehensively documented with examples.

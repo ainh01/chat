@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Login</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        max-width: 400px;
+        margin: 50px auto;
+      }
+      input {
+        display: block;
+        width: 100%;
+        margin: 10px 0;
+        padding: 8px;
+      }
+      button {
+        width: 100%;
+        padding: 10px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <h2>Login</h2>
+    <form id="loginForm">
+      <input type="text" id="username" placeholder="Username" required />
+      <input type="password" id="password" placeholder="Password" required />
+      <button type="submit">Login</button>
+    </form>
+
+    <script>
+      document
+        .getElementById("loginForm")
+        .addEventListener("submit", async (e) => {
+          e.preventDefault();
+
+          const username = document.getElementById("username").value;
+          const password = document.getElementById("password").value;
+
+          const query = `  
+        mutation Login($username: String!, $password: String!) {  
+          login(username: $username, password: $password) {  
+            success  
+            message  
+            user { id username }  
+          }  
+        }  
+      `;
+
+          try {
+            const response = await fetch("http://localhost:4000/graphql", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                query,
+                variables: { username, password },
+              }),
+            });
+
+            const { data, errors } = await response.json();
+
+            if (errors) {
+              alert("Error: " + errors[0].message);
+              return;
+            }
+
+            if (data.login.success) {
+              window.location.href = "index.html";
+            } else {
+              alert(data.login.message);
+            }
+          } catch (err) {
+            alert("Network error");
+          }
+        });
+    </script>
+  </body>
+</html>

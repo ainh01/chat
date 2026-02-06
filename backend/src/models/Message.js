@@ -37,6 +37,29 @@ const reactionSchema = new mongoose.Schema({
   }
 }, { _id: false });
 
+const callMetadataSchema = new mongoose.Schema({
+  type: {
+    type: String,
+    enum: ['voice', 'video', 'screen'],
+    required: true
+  },
+  duration: {
+    type: Number,
+    default: null,
+    min: 0
+  },
+  status: {
+    type: String,
+    enum: ['completed', 'missed', 'rejected'],
+    required: true
+  },
+  initiated_by: {
+    type: String,
+    required: true,
+    ref: 'User'
+  }
+}, { _id: false });
+
 const messageSchema = new mongoose.Schema({
   conversation_id: {
     type: mongoose.Schema.Types.ObjectId,
@@ -86,6 +109,11 @@ const messageSchema = new mongoose.Schema({
   reactions: {
     type: [reactionSchema],
     default: []
+  },
+
+  call_metadata: {
+    type: callMetadataSchema,
+    default: null
   }
 }, {
   timestamps: false,
@@ -93,7 +121,6 @@ const messageSchema = new mongoose.Schema({
 });
 
 messageSchema.index({ conversation_id: 1, time_sent: -1 });
-
 messageSchema.index({ _id: 1, sender_id: 1 });
 
 messageSchema.virtual('isVisible').get(function () {
