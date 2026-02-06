@@ -51,8 +51,7 @@ const { createMessageLoader } = require('./src/loaders/messageLoader.js');
 dotenv.config();  
 
 const PORT = process.env.PORT || 4000;  
-const REDIS_HOST = process.env.REDIS_HOST || 'localhost';  
-const REDIS_PORT = process.env.REDIS_PORT || 6379;  
+const REDIS_URL = process.env.REDIS_URL;  
 const SESSION_SECRET = process.env.SESSION_SECRET;  
 const SESSION_MAX_AGE = parseInt(process.env.SESSION_MAX_AGE) || 604800000;  
 const NODE_ENV = process.env.NODE_ENV || 'development';  
@@ -60,7 +59,33 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 
 debugServer('Environment: %s', NODE_ENV);  
 debugServer('Port: %d', PORT);  
-debugRedis('Redis configuration: %s:%d', REDIS_HOST, REDIS_PORT);  
+
+if (REDIS_URL) {  
+  try {  
+    const redisUrlObj = new URL(REDIS_URL);  
+    debugRedis('Redis configuration: host=%s, port=%s, protocol=%s, TLS=%s',  
+      redisUrlObj.hostname,  
+      redisUrlObj.port || '6379',  
+      redisUrlObj.protocol.replace(':', ''),  
+      redisUrlObj.protocol === 'rediss:' ? 'enabled' : 'disabled'  
+    );  
+  } catch (err) {  
+    debugError('Invalid REDIS_URL format: %s', err.message);  
+  }  
+} else {  
+  debugError('REDIS_URL is not defined');  
+}  
+
+if (!REDIS_URL) {  
+  debugError('REDIS_URL is not defined in environment variables');  
+  debugError('Application cannot start without Redis connection URL');  
+  process.exit(1);  
+}  
+
+if (!REDIS_URL.startsWith('rediss://') && !REDIS_URL.startsWith('redis://')) {  
+  debugError('REDIS_URL must start with redis:// or rediss:// protocol');  
+  process.exit(1);  
+}  
 
 if (!SESSION_SECRET) {  
   debugError('SESSION_SECRET is not defined in environment variables');  
@@ -86,17 +111,16 @@ const httpServer = http.createServer(app);
 // REDIS CLIENT CONFIGURATION WITH DEBUG LOGGING  
 // ============================================================  
 const redisClient = createClient({  
+  url: REDIS_URL,  
   socket: {  
-    host: REDIS_HOST,  
-    port: REDIS_PORT,  
     reconnectStrategy: (retries) => {  
       debugRedis('Reconnection attempt #%d', retries);  
-      
+
       if (retries > 10) {  
         debugError('Redis max reconnection attempts exceeded (10)');  
         return new Error('Redis connection failed');  
       }  
-      
+
       const delay = Math.min(retries * 100, 3000);  
       debugRedis('Reconnecting in %dms', delay);  
       return delay;  
@@ -114,7 +138,12 @@ redisClient.on('error', (err) => {
 });  
 
 redisClient.on('connect', () => {  
-  debugRedis('Redis client connecting to %s:%d', REDIS_HOST, REDIS_PORT);  
+  const redisUrlObj = new URL(REDIS_URL);  
+  debugRedis('Redis client connecting to %s:%s (TLS: %s)',  
+    redisUrlObj.hostname,  
+    redisUrlObj.port || '6379',  
+    redisUrlObj.protocol === 'rediss:' ? 'enabled' : 'disabled'  
+  );  
 });  
 
 redisClient.on('ready', () => {  
@@ -149,7 +178,7 @@ const sessionMiddleware = session({
   name: 'connect.sid'  
 });  
 
-debugSession('Session middleware configured: httpOnly=%s, secure=%s, sameSite=lax, maxAge=%dms',   
+debugSession('Session middleware configured: httpOnly=%s, secure=%s, sameSite=lax, maxAge=%dms',  
   true, NODE_ENV === 'production', SESSION_MAX_AGE);  
 
 const corsOptions = {  
@@ -212,14 +241,14 @@ async function getSessionFromWebSocket(ctx) {
       try {  
         const { findUserById } = require('./src/models/UserCore.js');  
         const user = await findUserById(session.userId);  
-        
+
         if (user) {  
-          debugSession('WebSocket authenticated: userId=%s, username=%s',   
+          debugSession('WebSocket authenticated: userId=%s, username=%s',  
             user.id, user.username || 'N/A');  
         } else {  
           debugSession('WebSocket session userId=%s not found in database', session.userId);  
         }  
-        
+
         resolve({ user });  
       } catch (error) {  
         debugError('Error fetching user for WebSocket session: %s', error.message);  
@@ -237,7 +266,7 @@ const wsServer = new WebSocketServer({
   path: '/graphql',  
   handleProtocols: (protocols) => {  
     debugWebSocket('Client protocol negotiation: %O', protocols);  
-    
+
     if (protocols.includes('graphql-transport-ws')) {  
       debugWebSocket('Selected protocol: graphql-transport-ws');  
       return 'graphql-transport-ws';  
@@ -246,7 +275,7 @@ const wsServer = new WebSocketServer({
       debugWebSocket('Selected protocol: graphql-ws');  
       return 'graphql-ws';  
     }  
-    
+
     debugWebSocket('No supported protocol found');  
     return false;  
   }  
@@ -259,7 +288,7 @@ const serverCleanup = useServer({
   onConnect: async (ctx) => {  
     const clientIp = ctx.extra?.request?.socket?.remoteAddress || 'unknown';  
     debugWebSocket('New WebSocket connection from IP: %s', clientIp);  
-    
+
     const { user } = await getSessionFromWebSocket(ctx);  
 
     if (user) {  
@@ -268,13 +297,13 @@ const serverCleanup = useServer({
     } else {  
       debugWebSocket('WebSocket connection unauthenticated');  
     }  
-    
+
     return true;  
   },  
 
   context: async (ctx) => {  
     const user = ctx.extra?.user || null;  
-    
+
     debugWebSocket('Creating WebSocket context: authenticated=%s', !!user);  
 
     return {  
@@ -289,14 +318,14 @@ const serverCleanup = useServer({
     const query = msg.payload?.query || msg.query || 'Unknown Subscription Query';  
     const operationName = msg.payload?.operationName || 'N/A';  
     const user = ctx.extra?.user;  
-    
-    debugWebSocket('Subscription started: operation=%s, userId=%s, subscriptionId=%s',   
-      operationName,   
+
+    debugWebSocket('Subscription started: operation=%s, userId=%s, subscriptionId=%s',  
+      operationName,  
       user ? user.id : 'anonymous',  
       msg.id || 'N/A'  
     );  
-    
-    debugWebSocket('Subscription query preview: %s',   
+
+    debugWebSocket('Subscription query preview: %s',  
       query.substring(0, 100).replace(/\s+/g, ' ')  
     );  
   },  
@@ -304,8 +333,8 @@ const serverCleanup = useServer({
   onComplete: (ctx, msg) => {  
     const user = ctx.extra?.user;  
     const subscriptionId = msg.id || 'N/A';  
-    
-    debugWebSocket('Subscription completed: subscriptionId=%s, userId=%s',   
+
+    debugWebSocket('Subscription completed: subscriptionId=%s, userId=%s',  
       subscriptionId,  
       user ? user.id : 'anonymous'  
     );  
@@ -314,13 +343,13 @@ const serverCleanup = useServer({
   onError: (ctx, msg, errors) => {  
     const user = ctx.extra?.user;  
     const operationName = msg?.payload?.operationName || 'Unknown';  
-    
+
     debugError('WebSocket subscription error: operation=%s, userId=%s, errorCount=%d',  
       operationName,  
       user ? user.id : 'anonymous',  
       errors.length  
     );  
-    
+
     errors.forEach((error, index) => {  
       debugError('Subscription error #%d: %s', index + 1, error.message);  
       if (error.stack) {  
@@ -333,10 +362,10 @@ const serverCleanup = useServer({
 wsServer.on('connection', (ws, request) => {  
   const clientIp = request.socket.remoteAddress;  
   const url = request.url;  
-  
+
   debugWebSocket('WebSocket connection established: ip=%s, url=%s', clientIp, url);  
   debugWebSocket('Active connections: %d', wsServer.clients.size);  
-  
+
   ws.on('close', (code, reason) => {  
     debugWebSocket('WebSocket client disconnected: ip=%s, code=%d, reason=%s',  
       clientIp,  
@@ -391,18 +420,18 @@ const apolloServer = new ApolloServer({
   formatError: (formattedError, error) => {  
     debugError('GraphQL error: %s', formattedError.message);  
     debugError('Error code: %s', formattedError.extensions?.code || 'N/A');  
-    
+
     if (formattedError.path) {  
       debugError('Error path: %O', formattedError.path);  
     }  
-    
+
     if (error.originalError) {  
       debugError('Original error: %s', error.originalError.message);  
       debugError('Stack trace: %s', error.originalError.stack);  
     }  
 
     if (NODE_ENV === 'production') {  
-      if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR' ||   
+      if (formattedError.extensions?.code === 'INTERNAL_SERVER_ERROR' ||  
           formattedError.message.includes('Internal server error')) {  
         debugError('Sanitizing internal error for production response');  
         return {  
@@ -426,7 +455,7 @@ debugApollo('Apollo Server configured: introspection=%s, playground=%s',
 async function startServer() {  
   const startTime = Date.now();  
   debugServer('Starting server initialization...');  
-  
+
   try {  
     // Redis connection  
     debugRedis('Connecting to Redis...');  
@@ -463,11 +492,11 @@ async function startServer() {
       expressMiddleware(apolloServer, {  
         context: async ({ req, res }) => {  
           const userId = req.session?.userId;  
-          
+
           if (userId) {  
             debugSession('GraphQL request with session: userId=%s', userId);  
           }  
-          
+
           const context = await buildContext({ req, res });  
           return {  
             ...context,  
@@ -482,7 +511,7 @@ async function startServer() {
     // Health check endpoint  
     app.get('/health', async (req, res) => {  
       const mongoose = require('mongoose');  
-      
+
       const healthData = {  
         status: 'ok',  
         timestamp: new Date().toISOString(),  
@@ -491,7 +520,7 @@ async function startServer() {
         mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',  
         pubsub: (typeof pubsub.asyncIterator === 'function' && typeof pubsub.publish === 'function') ? 'initialized' : 'error'  
       };  
-      
+
       debugServer('Health check: %O', healthData);  
       res.json(healthData);  
     });  
@@ -504,7 +533,7 @@ async function startServer() {
     // Start HTTP server  
     httpServer.listen(PORT, () => {  
       const elapsedTime = Date.now() - startTime;  
-      
+
       debugServer('═══════════════════════════════════════════════════');  
       debugServer('🚀 Server started successfully in %dms', elapsedTime);  
       debugServer('═══════════════════════════════════════════════════');  
@@ -514,7 +543,7 @@ async function startServer() {
       debugServer('WebSocket Endpoint: ws://localhost:%d/graphql', PORT);  
       debugServer('Health Check: http://localhost:%d/health', PORT);  
       debugServer('═══════════════════════════════════════════════════');  
-      
+
       console.log(`🚀 Server ready at http://localhost:${PORT}/graphql`);  
       console.log(`🔌 WebSocket ready at ws://localhost:${PORT}/graphql`);  
       console.log(`💚 Health check at http://localhost:${PORT}/health`);  
@@ -524,7 +553,7 @@ async function startServer() {
     debugError('Server startup failed: %s', error.message);  
     debugError('Error stack: %s', error.stack);  
     debugError('Fatal error during initialization - exiting process');  
-    
+
     console.error('❌ Server startup failed:', error.message);  
     process.exit(1);  
   }  
@@ -536,7 +565,7 @@ async function startServer() {
 async function shutdown(signal) {  
   debugServer('Received %s signal - initiating graceful shutdown', signal);  
   debugServer('═══════════════════════════════════════════════════');  
-  
+
   const shutdownStart = Date.now();  
 
   try {  
@@ -581,7 +610,7 @@ async function shutdown(signal) {
     debugError('Error during shutdown: %s', error.message);  
     debugError('Shutdown error stack: %s', error.stack);  
     debugError('Forcing process exit due to shutdown error');  
-    
+
     console.error('❌ Shutdown error:', error.message);  
     process.exit(1);  
   }  
@@ -604,7 +633,7 @@ process.on('uncaughtException', (error) => {
   debugError('Uncaught Exception: %s', error.message);  
   debugError('Exception stack: %s', error.stack);  
   debugError('Process state may be corrupted - initiating shutdown');  
-  
+
   console.error('❌ Uncaught Exception:', error);  
   shutdown('uncaughtException');  
 });  
@@ -612,11 +641,11 @@ process.on('uncaughtException', (error) => {
 process.on('unhandledRejection', (reason, promise) => {  
   debugError('Unhandled Promise Rejection at: %O', promise);  
   debugError('Rejection reason: %s', reason);  
-  
+
   if (reason && reason.stack) {  
     debugError('Rejection stack: %s', reason.stack);  
   }  
-  
+
   console.error('❌ Unhandled Rejection:', reason);  
   shutdown('unhandledRejection');  
 });  

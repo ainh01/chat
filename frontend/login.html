@@ -3,6 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <title>Login</title>
+    <script src="./js/config.js"></script>
     <style>
       body {
         font-family: sans-serif;
@@ -39,18 +40,18 @@
           const username = document.getElementById("username").value;
           const password = document.getElementById("password").value;
 
-          const query = `  
-        mutation Login($username: String!, $password: String!) {  
-          login(username: $username, password: $password) {  
-            success  
-            message  
-            user { id username }  
-          }  
-        }  
+          const query = `
+        mutation Login($username: String!, $password: String!) {
+          login(username: $username, password: $password) {
+            success
+            message
+            user { id username }
+          }
+        }
       `;
 
           try {
-            const response = await fetch("http://localhost:4000/graphql", {
+            const response = await fetch(`${API_CONFIG.BASE_URL}/graphql`, {
               method: "POST",
               credentials: "include",
               headers: { "Content-Type": "application/json" },
