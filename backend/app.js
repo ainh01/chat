@@ -168,6 +168,7 @@ debugSession('RedisStore configured with TTL: %ds', SESSION_MAX_AGE / 1000);
 // ============================================================  
 const ALLOWED_ORIGINS = [  
   FRONTEND_URL,  
+BACKEND_URL,
   'http://localhost:5500',  
   'http://localhost:3000'  
 ].filter(Boolean);  
