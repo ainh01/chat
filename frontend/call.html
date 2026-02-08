@@ -1,0 +1,690 @@
+<!doctype html>  
+<html>  
+<head>  
+  <meta charset="UTF-8">  
+  <title>Call</title>  
+  <script src="./public/js/config.js"></script>  
+  <style>  
+    * {  
+      box-sizing: border-box;  
+      margin: 0;  
+      padding: 0;  
+    }  
+    body {  
+      font-family: monospace;  
+      font-size: 12px;  
+      padding: 20px;  
+    }  
+    .section {  
+      border: 1px solid #000;  
+      padding: 15px;  
+      margin-bottom: 15px;  
+    }  
+    h2 {  
+      margin-bottom: 10px;  
+      font-size: 14px;  
+    }  
+    select, button {  
+      padding: 8px;  
+      margin: 5px 5px 5px 0;  
+      border: 1px solid #000;  
+      background: #fff;  
+      cursor: pointer;  
+      font-family: monospace;  
+    }  
+    select {  
+      min-width: 200px;  
+    }  
+    #incomingCallPanel {  
+      display: none;  
+    }  
+    #incomingCallPanel.show {  
+      display: block;  
+    }  
+    #videoContainer {  
+      display: none;  
+      grid-template-columns: 1fr 1fr;  
+      gap: 10px;  
+      margin: 10px 0;  
+    }  
+    #videoContainer.show {  
+      display: grid;  
+    }  
+    .video-wrapper {  
+      border: 1px solid #000;  
+      padding: 5px;  
+    }  
+    .video-wrapper h3 {  
+      font-size: 12px;  
+      margin-bottom: 5px;  
+    }  
+    video {  
+      width: 100%;  
+      background: #000;  
+      display: block;  
+      min-height: 200px;  
+    }  
+    #callControls {  
+      display: none;  
+    }  
+    #callControls.show {  
+      display: block;  
+    }  
+    #statusDisplay {  
+      padding: 10px;  
+      border: 1px solid #000;  
+      min-height: 40px;  
+    }  
+  </style>  
+</head>  
+<body>  
+
+  <div class="section">  
+    <h2>Initiate Call</h2>  
+    <select id="friendSelect">  
+      <option value="">Select a friend...</option>  
+    </select>  
+    <button id="voiceCallBtn">Voice Call</button>  
+    <button id="videoCallBtn">Video Call</button>  
+    <button id="screenShareBtn">Screen Share</button>  
+  </div>  
+
+  <div class="section" id="incomingCallPanel">  
+    <h2>Incoming Call</h2>  
+    <div id="incomingCallInfo"></div>  
+    <button id="answerBtn">Answer</button>  
+    <button id="rejectBtn">Reject</button>  
+  </div>  
+
+  <div class="section">  
+    <h2>Call Status</h2>  
+    <div id="statusDisplay">  
+      <div><strong>Status:</strong> <span id="callStatus">Idle</span></div>  
+      <div><strong>Call ID:</strong> <span id="callId">-</span></div>  
+    </div>  
+  </div>  
+
+  <div id="videoContainer">  
+    <div class="video-wrapper">  
+      <h3>Local</h3>  
+      <video id="localVideo" autoplay muted playsinline></video>  
+    </div>  
+    <div class="video-wrapper">  
+      <h3>Remote</h3>  
+      <video id="remoteVideo" autoplay playsinline></video>  
+    </div>  
+  </div>  
+
+  <div class="section" id="callControls">  
+    <h2>Call Controls</h2>  
+    <button id="endCallBtn">End Call</button>  
+  </div>  
+
+  <script>  
+    const GRAPHQL_URL = `${API_CONFIG.BASE_URL}/graphql`;  
+    const WS_URL = `${API_CONFIG.BASE_URL.replace('http', 'ws')}/graphql`;  
+
+    let myUserId = null;  
+    let friends = [];  
+    let currentCallId = null;  
+    let currentCallType = null;  
+    let isInitiator = false;  
+    let peerConnection = null;  
+    let localStream = null;  
+    let remoteStream = null;  
+    let ws = null;  
+    let subscriptionId = 1;  
+    let stunServers = [];  
+    let pendingIceCandidates = [];  
+    
+    // BUG FIX #1: Track subscription readiness  
+    // ROOT CAUSE: Subscriptions are asynchronous - the subscribe() call sends a message  
+    // to the server, but we need to wait for the server to register it before signals  
+    // can be received. Without waiting, signals sent immediately are lost.  
+    let signalSubscriptionReady = false;  
+    let stateSubscriptionReady = false;  
+    const subscriptionPromises = new Map();  
+
+    const friendSelect = document.getElementById('friendSelect');  
+    const incomingCallPanel = document.getElementById('incomingCallPanel');  
+    const incomingCallInfo = document.getElementById('incomingCallInfo');  
+    const videoContainer = document.getElementById('videoContainer');  
+    const callControls = document.getElementById('callControls');  
+    const localVideo = document.getElementById('localVideo');  
+    const remoteVideo = document.getElementById('remoteVideo');  
+    const callStatus = document.getElementById('callStatus');  
+    const callIdDisplay = document.getElementById('callId');  
+
+    async function graphql(query, variables = {}) {  
+      const response = await fetch(GRAPHQL_URL, {  
+        method: 'POST',  
+        credentials: 'include',  
+        headers: { 'Content-Type': 'application/json' },  
+        body: JSON.stringify({ query, variables })  
+      });  
+      const result = await response.json();  
+      if (result.errors) {  
+        throw new Error(result.errors[0].message);  
+      }  
+      return result.data;  
+    }  
+
+    function updateStatus(status) {  
+      callStatus.textContent = status;  
+    }  
+
+    async function loadMe() {  
+      const data = await graphql(`query { me { user { id username } } }`);  
+      myUserId = data.me.user.id;  
+    }  
+
+    async function loadFriends() {  
+      const data = await graphql(`  
+        query {  
+          myFriends {  
+            friends {  
+              friendId  
+              friend { id username }  
+            }  
+          }  
+        }  
+      `);  
+
+      friends = data.myFriends.friends;  
+      friendSelect.innerHTML = '<option value="">Select a friend...</option>';  
+      
+      friends.forEach(f => {  
+        const option = document.createElement('option');  
+        option.value = f.friend.id;  
+        option.textContent = f.friend.username;  
+        friendSelect.appendChild(option);  
+      });  
+    }  
+
+    function setupWebSocket() {  
+      ws = new WebSocket(WS_URL, 'graphql-transport-ws');  
+
+      ws.onopen = () => {  
+        ws.send(JSON.stringify({ type: 'connection_init' }));  
+      };  
+
+      ws.onmessage = (event) => {  
+        const msg = JSON.parse(event.data);  
+
+        if (msg.type === 'connection_ack') {  
+          subscribeToIncomingCalls();  
+        }  
+
+        // BUG FIX #1: Resolve subscription promises when server confirms  
+        // This allows us to wait for subscription readiness before sending signals  
+        if (msg.type === 'next' && msg.id) {  
+          const promise = subscriptionPromises.get(msg.id);  
+          if (promise && !promise.resolved) {  
+            promise.resolve();  
+            promise.resolved = true;  
+          }  
+        }  
+
+        if (msg.type === 'next' && msg.payload?.data) {  
+          handleSubscriptionData(msg.payload.data);  
+        }  
+      };  
+
+      ws.onerror = () => {};  
+      ws.onclose = () => {};  
+    }  
+
+    function subscribeToIncomingCalls() {  
+      const query = `  
+        subscription {  
+          incomingCall {  
+            call { id type status startTime participantIds }  
+            caller { id username }  
+          }  
+        }  
+      `;  
+      subscribe(query);  
+    }  
+
+    // BUG FIX #1: Return promise that resolves when subscription is confirmed  
+    function subscribeToCallSignals(callId) {  
+      const query = `  
+        subscription {  
+          callSignal(callId: "${callId}") {  
+            callId senderId type payload  
+          }  
+        }  
+      `;  
+      return subscribe(query);  
+    }  
+
+    // BUG FIX #2: Make call state subscription return a promise  
+    // ROOT CAUSE: Call state subscription wasn't being established early enough  
+    // for the recipient. Now we ensure it's ready before any call operations.  
+    function subscribeToCallState(callId) {  
+      const query = `  
+        subscription {  
+          callStateChanged(callId: "${callId}") {  
+            callId status timestamp  
+          }  
+        }  
+      `;  
+      return subscribe(query);  
+    }  
+
+    // BUG FIX #1: Modified to return promise for subscription confirmation  
+    function subscribe(query) {  
+      const id = String(subscriptionId++);  
+      
+      let resolveFunc;  
+      const promise = new Promise(resolve => {  
+        resolveFunc = resolve;  
+      });  
+      
+      subscriptionPromises.set(id, { resolve: resolveFunc, resolved: false });  
+      
+      // Auto-resolve after timeout as fallback  
+      setTimeout(() => {  
+        const p = subscriptionPromises.get(id);  
+        if (p && !p.resolved) {  
+          p.resolve();  
+          p.resolved = true;  
+        }  
+      }, 1000);  
+      
+      ws.send(JSON.stringify({ id, type: 'subscribe', payload: { query } }));  
+      
+      return promise;  
+    }  
+
+    function handleSubscriptionData(data) {  
+      if (data.incomingCall) {  
+        handleIncomingCall(data.incomingCall);  
+      }  
+      if (data.callSignal) {  
+        handleCallSignal(data.callSignal);  
+      }  
+      if (data.callStateChanged) {  
+        handleCallStateChange(data.callStateChanged);  
+      }  
+    }  
+
+    // BUG FIX #2: Establish state subscription immediately on incoming call  
+    // This ensures termination events are received even if user delays answering  
+    async function handleIncomingCall(notification) {  
+      const { call, caller } = notification;  
+
+      currentCallId = call.id;  
+      currentCallType = call.type;  
+      isInitiator = false;  
+
+      // BUG FIX #2: Subscribe to state changes IMMEDIATELY when call comes in  
+      // This ensures we receive "ended" event even if peer hangs up while we're  
+      // still in the permission dialog  
+      await subscribeToCallState(currentCallId);  
+
+      incomingCallInfo.innerHTML = `  
+        <strong>${caller.username}</strong> is calling you<br>  
+        Type: <strong>${call.type.toUpperCase()}</strong>  
+      `;  
+      incomingCallPanel.classList.add('show');  
+      updateStatus('Ringing');  
+      callIdDisplay.textContent = call.id;  
+    }  
+
+    async function answerCall() {  
+      incomingCallPanel.classList.remove('show');  
+      updateStatus('Answering...');  
+
+      try {  
+        // BUG FIX #1: Subscribe and WAIT for confirmation before answering  
+        // This ensures the server has registered our subscription before the peer  
+        // can send us signals (offer/ICE candidates)  
+        await subscribeToCallSignals(currentCallId);  
+
+        const data = await graphql(`  
+          mutation {  
+            answerCall(callId: "${currentCallId}") {  
+              success message  
+              call { id type status }  
+              stunServers { urls }  
+            }  
+          }  
+        `);  
+
+        if (!data.answerCall.success) {  
+          alert(data.answerCall.message);  
+          return;  
+        }  
+
+        stunServers = data.answerCall.stunServers.urls;  
+        updateStatus('Setting up media...');  
+
+        await setupLocalMedia(currentCallType);  
+        setupPeerConnection();  
+
+        updateStatus('Waiting for offer...');  
+        showCallUI();  
+
+      } catch (err) {  
+        alert('Error answering call: ' + err.message);  
+      }  
+    }  
+
+    async function rejectCall() {  
+      incomingCallPanel.classList.remove('show');  
+
+      try {  
+        await graphql(`mutation { rejectCall(callId: "${currentCallId}") }`);  
+        resetCallState();  
+      } catch (err) {  
+        alert('Error rejecting call');  
+      }  
+    }  
+
+    async function initiateCall(callType) {  
+      const friendId = friendSelect.value;  
+      if (!friendId) {  
+        alert('Please select a friend first');  
+        return;  
+      }  
+
+      try {  
+        const data = await graphql(`  
+          mutation {  
+            initiateCall(recipientId: "${friendId}", callType: ${callType}) {  
+              success message  
+              call { id type status participantIds }  
+              stunServers { urls }  
+            }  
+          }  
+        `);  
+
+        if (!data.initiateCall.success) {  
+          alert(data.initiateCall.message);  
+          return;  
+        }  
+
+        currentCallId = data.initiateCall.call.id;  
+        currentCallType = callType;  
+        isInitiator = true;  
+        stunServers = data.initiateCall.stunServers.urls;  
+
+        updateStatus('Ringing...');  
+        callIdDisplay.textContent = currentCallId;  
+
+        // BUG FIX #1: Subscribe and WAIT before setting up media  
+        // This ensures subscriptions are ready before peer can send signals  
+        await subscribeToCallSignals(currentCallId);  
+        await subscribeToCallState(currentCallId);  
+
+        await setupLocalMedia(callType);  
+        setupPeerConnection();  
+
+        showCallUI();  
+
+      } catch (err) {  
+        alert('Failed to initiate call: ' + err.message);  
+      }  
+    }  
+
+    async function setupLocalMedia(callType) {  
+      try {  
+        if (callType === 'voice') {  
+          localStream = await navigator.mediaDevices.getUserMedia({   
+            audio: true,   
+            video: false   
+          });  
+        } else if (callType === 'video') {  
+          localStream = await navigator.mediaDevices.getUserMedia({   
+            audio: true,   
+            video: true   
+          });  
+        } else if (callType === 'screen') {  
+          localStream = await navigator.mediaDevices.getDisplayMedia({   
+            video: true,   
+            audio: true   
+          });  
+        }  
+
+        localVideo.srcObject = localStream;  
+
+      } catch (err) {  
+        throw err;  
+      }  
+    }  
+
+    function setupPeerConnection() {  
+      const config = {  
+        iceServers: stunServers.length > 0   
+          ? stunServers.map(url => ({ urls: url }))  
+          : [{ urls: 'stun:stun.l.google.com:19302' }]  
+      };  
+
+      peerConnection = new RTCPeerConnection(config);  
+
+      if (localStream) {  
+        localStream.getTracks().forEach(track => {  
+          peerConnection.addTrack(track, localStream);  
+        });  
+      }  
+
+      peerConnection.onicecandidate = (event) => {  
+        if (event.candidate) {  
+          sendICECandidate(event.candidate);  
+        }  
+      };  
+
+      remoteStream = new MediaStream();  
+      remoteVideo.srcObject = remoteStream;  
+
+      peerConnection.ontrack = (event) => {  
+        remoteStream.addTrack(event.track);  
+      };  
+
+      peerConnection.onconnectionstatechange = () => {};  
+      peerConnection.oniceconnectionstatechange = () => {};  
+    }  
+
+    async function createAndSendOffer() {  
+      try {  
+        const offer = await peerConnection.createOffer();  
+        await peerConnection.setLocalDescription(offer);  
+
+        const sdpPayload = JSON.stringify({  
+          type: offer.type,  
+          sdp: offer.sdp  
+        }).replace(/\\/g, '\\\\').replace(/"/g, '\\"');  
+
+        await graphql(`  
+          mutation {  
+            sendSDPOffer(  
+              callId: "${currentCallId}",  
+              sdp: "${sdpPayload}"  
+            )  
+          }  
+        `);  
+      } catch (err) {  
+        alert('Error creating offer');  
+      }  
+    }  
+
+    async function createAndSendAnswer() {  
+      try {  
+        const answer = await peerConnection.createAnswer();  
+        await peerConnection.setLocalDescription(answer);  
+
+        const sdpPayload = JSON.stringify({  
+          type: answer.type,  
+          sdp: answer.sdp  
+        }).replace(/\\/g, '\\\\').replace(/"/g, '\\"');  
+
+        await graphql(`  
+          mutation {  
+            sendSDPAnswer(  
+              callId: "${currentCallId}",  
+              sdp: "${sdpPayload}"  
+            )  
+          }  
+        `);  
+
+        await processQueuedCandidates();  
+
+      } catch (err) {  
+        alert('Error creating answer');  
+      }  
+    }  
+
+    async function processQueuedCandidates() {  
+      if (pendingIceCandidates.length > 0) {  
+        for (const candidate of pendingIceCandidates) {  
+          try {  
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));  
+          } catch (err) {}  
+        }  
+        pendingIceCandidates = [];  
+      }  
+    }  
+
+    async function sendICECandidate(candidate) {  
+      try {  
+        const candidatePayload = JSON.stringify({  
+          candidate: candidate.candidate,  
+          sdpMLineIndex: candidate.sdpMLineIndex,  
+          sdpMid: candidate.sdpMid  
+        }).replace(/\\/g, '\\\\').replace(/"/g, '\\"');  
+
+        await graphql(`  
+          mutation {  
+            sendICECandidate(  
+              callId: "${currentCallId}",  
+              candidate: "${candidatePayload}"  
+            )  
+          }  
+        `);  
+      } catch (err) {}  
+    }  
+
+    async function handleCallSignal(signal) {  
+      try {  
+        if (signal.type === 'offer') {  
+          const sdp = typeof signal.payload === 'string'   
+            ? JSON.parse(signal.payload)   
+            : signal.payload;  
+          
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));  
+          await createAndSendAnswer();  
+
+        } else if (signal.type === 'answer') {  
+          const sdp = typeof signal.payload === 'string'   
+            ? JSON.parse(signal.payload)   
+            : signal.payload;  
+          
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(sdp));  
+          await processQueuedCandidates();  
+
+        } else if (signal.type === 'ice-candidate') {  
+          const candidate = typeof signal.payload === 'string'   
+            ? JSON.parse(signal.payload)   
+            : signal.payload;  
+
+          if (!peerConnection || !peerConnection.remoteDescription) {  
+            pendingIceCandidates.push(candidate);  
+            return;  
+          }  
+
+          try {  
+            await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));  
+          } catch (err) {}  
+        }  
+      } catch (err) {}  
+    }  
+
+    function handleCallStateChange(stateChange) {  
+      updateStatus(stateChange.status);  
+
+      if (stateChange.status === 'active') {  
+        if (isInitiator && peerConnection && !peerConnection.localDescription) {  
+          setTimeout(() => createAndSendOffer(), 200);  
+        }  
+      }  
+
+      // BUG FIX #2: Properly handle call termination for both peers  
+      // When one peer ends the call, both receive this state change via subscription  
+      if (['ended', 'rejected', 'missed'].includes(stateChange.status)) {  
+        cleanup();  
+        resetCallState();  
+      }  
+    }  
+
+    async function endCall() {  
+      if (currentCallId) {  
+        try {  
+          // BUG FIX #2: This mutation triggers callStateChanged subscription for BOTH peers  
+          // The subscription handler above will clean up the call for both users  
+          await graphql(`mutation { endCall(callId: "${currentCallId}") }`);  
+        } catch (err) {  
+          alert('Error ending call');  
+        }  
+      }  
+
+      cleanup();  
+      resetCallState();  
+    }  
+
+    function cleanup() {  
+      if (localStream) {  
+        localStream.getTracks().forEach(track => track.stop());  
+        localStream = null;  
+      }  
+
+      if (peerConnection) {  
+        peerConnection.close();  
+        peerConnection = null;  
+      }  
+
+      remoteStream = null;  
+      localVideo.srcObject = null;  
+      remoteVideo.srcObject = null;  
+    }  
+
+    function resetCallState() {  
+      currentCallId = null;  
+      currentCallType = null;  
+      isInitiator = false;  
+      stunServers = [];  
+      pendingIceCandidates = [];  
+
+      updateStatus('Idle');  
+      callIdDisplay.textContent = '-';  
+
+      videoContainer.classList.remove('show');  
+      callControls.classList.remove('show');  
+      incomingCallPanel.classList.remove('show');  
+    }  
+
+    function showCallUI() {  
+      videoContainer.classList.add('show');  
+      callControls.classList.add('show');  
+    }  
+
+    document.getElementById('voiceCallBtn').onclick = () => initiateCall('voice');  
+    document.getElementById('videoCallBtn').onclick = () => initiateCall('video');  
+    document.getElementById('screenShareBtn').onclick = () => initiateCall('screen');  
+    document.getElementById('answerBtn').onclick = answerCall;  
+    document.getElementById('rejectBtn').onclick = rejectCall;  
+    document.getElementById('endCallBtn').onclick = endCall;  
+
+    (async () => {  
+      try {  
+        await loadMe();  
+        await loadFriends();  
+        setupWebSocket();  
+      } catch (err) {  
+        alert('Failed to initialize. Please check login status.');  
+      }  
+    })();  
+  </script>  
+
+</body>  
+</html>  
