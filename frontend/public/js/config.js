@@ -1,3 +1,3 @@
 const API_CONFIG = {
-  BASE_URL: 'http://localhost:4000',
+  BASE_URL: '__BASE_URL__',
 };
