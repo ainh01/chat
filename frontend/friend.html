@@ -1,251 +1,443 @@
-<!doctype html>  
-<html>  
-<head>  
-  <meta charset="UTF-8">  
-  <title>Friend Management</title>  
-  <script src="./public/js/config.js"></script>  
-  <style>  
-    * { box-sizing: border-box; margin: 0; padding: 0; }  
-    body {  
-      font-family: monospace;  
-      font-size: 12px;  
-      max-width: 800px;  
-      margin: 20px auto;  
-      padding: 20px;  
-    }  
-    h2 { margin-bottom: 15px; }  
-    h3 { margin: 20px 0 10px 0; border-bottom: 1px solid #000; padding-bottom: 5px; }  
-    .box {  
-      border: 1px solid #000;  
-      padding: 10px;  
-      margin: 10px 0;  
-    }  
-    input {  
-      padding: 6px;  
-      border: 1px solid #000;  
-      font-family: monospace;  
-      font-size: 12px;  
-      margin-right: 5px;  
-    }  
-    button {  
-      padding: 6px 12px;  
-      cursor: pointer;  
-      border: 1px solid #000;  
-      background: #fff;  
-      font-family: monospace;  
-      font-size: 12px;  
-      margin: 2px;  
-    }  
-    button:hover { background: #f0f0f0; }  
-    .item {  
-      border: 1px solid #000;  
-      padding: 8px;  
-      margin: 5px 0;  
-    }  
-    .empty { color: #666; font-style: italic; }  
-    a { color: #000; }  
-  </style>  
-</head>  
-<body>  
-  <h2>Friend Management</h2>  
-  <a href="index.html">← Back to Chat</a>  
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Friend Management</title>
+    <script src="./public/js/config.js"></script>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        font-size: 14px;
+        background: #f0f2f5;
+        padding: 20px;
+        min-height: 100vh;
+      }
+      .container {
+        max-width: 800px;
+        margin: 0 auto;
+        background: #fff;
+        border-radius: 16px;
+        padding: 32px;
+        box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+      }
+      h2 {
+        font-size: 28px;
+        font-weight: 700;
+        color: #050505;
+        margin-bottom: 24px;
+      }
+      h3 {
+        font-size: 18px;
+        font-weight: 600;
+        color: #050505;
+        margin: 32px 0 16px 0;
+        padding-bottom: 12px;
+        border-bottom: 2px solid #e4e6eb;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      .back-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 8px 16px;
+        background: #f0f2f5;
+        color: #050505;
+        text-decoration: none;
+        border-radius: 8px;
+        font-weight: 500;
+        margin-bottom: 24px;
+        transition: background 0.2s;
+      }
+      .back-link:hover {
+        background: #e4e6eb;
+      }
+      .box {
+        background: #f0f2f5;
+        border: none;
+        border-radius: 12px;
+        padding: 20px;
+        margin: 16px 0;
+      }
+      .input-group {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 12px;
+      }
+      input {
+        flex: 1;
+        padding: 10px 16px;
+        border: 1px solid #e4e6eb;
+        border-radius: 20px;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        font-size: 14px;
+        outline: none;
+        transition: all 0.2s;
+        background: #fff;
+      }
+      input:focus {
+        border-color: #0084ff;
+        box-shadow: 0 0 0 3px rgba(0, 132, 255, 0.1);
+      }
+      button {
+        padding: 10px 20px;
+        cursor: pointer;
+        border: none;
+        background: #0084ff;
+        color: #fff;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        font-size: 14px;
+        font-weight: 600;
+        border-radius: 20px;
+        transition: all 0.2s;
+      }
+      button:hover {
+        background: #0073e6;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(0, 132, 255, 0.3);
+      }
+      button:active {
+        transform: translateY(0);
+      }
+      .item {
+        background: #fff;
+        border: 1px solid #e4e6eb;
+        border-radius: 12px;
+        padding: 16px;
+        margin: 12px 0;
+        transition: all 0.2s;
+      }
+      .item:hover {
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+        transform: translateY(-2px);
+      }
+      .item strong {
+        font-size: 16px;
+        color: #050505;
+      }
+      .item small {
+        color: #65676b;
+        font-size: 12px;
+      }
+      .item button {
+        margin-top: 12px;
+        margin-right: 8px;
+        padding: 8px 16px;
+        font-size: 13px;
+      }
+      .item button:last-child {
+        background: #e4e6eb;
+        color: #050505;
+      }
+      .item button:last-child:hover {
+        background: #d8dadf;
+      }
+      .empty {
+        color: #65676b;
+        font-style: italic;
+        text-align: center;
+        padding: 32px;
+        background: #f0f2f5;
+        border-radius: 12px;
+      }
+      .count-badge {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: #0084ff;
+        color: #fff;
+        font-size: 12px;
+        font-weight: 700;
+        min-width: 24px;
+        height: 24px;
+        border-radius: 12px;
+        padding: 0 8px;
+      }
+      #sendResult {
+        margin-top: 12px;
+        padding: 12px;
+        border-radius: 8px;
+        font-size: 13px;
+        background: #e7f3ff;
+        color: #0084ff;
+        display: none;
+      }
+      #sendResult:not(:empty) {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h2>👥 Friend Management</h2>
+      <a href="/" class="back-link"> ← Back to Chat </a>
 
-  <h3>A. Send Friend Request</h3>  
-  <div class="box">  
-    <input type="text" id="toUserId" placeholder="User ID">  
-    <button onclick="sendRequest()">Send</button>  
-    <div id="sendResult"></div>  
-  </div>  
+      <h3>📤 Send Friend Request</h3>
+      <div class="box">
+        <div class="input-group">
+          <input type="text" id="toUserId" placeholder="Enter User ID" />
+          <button onclick="sendRequest()">Send Request</button>
+        </div>
+        <div id="sendResult"></div>
+      </div>
 
-  <h3>B. Received Requests (<span id="receivedCount">0</span>)</h3>  
-  <div id="receivedList"></div>  
+      <h3>
+        📥 Received Requests
+        <span class="count-badge" id="receivedCount">0</span>
+      </h3>
+      <div id="receivedList"></div>
 
-  <h3>C. Sent Requests (<span id="sentCount">0</span>)</h3>  
-  <div id="sentList"></div>  
+      <h3>
+        📤 Sent Requests
+        <span class="count-badge" id="sentCount">0</span>
+      </h3>
+      <div id="sentList"></div>
 
-  <h3>D. My Friends (<span id="friendsCount">0</span>)</h3>  
-  <div id="friendsList"></div>  
+      <h3>
+        ✅ My Friends
+        <span class="count-badge" id="friendsCount">0</span>
+      </h3>
+      <div id="friendsList"></div>
+    </div>
 
-  <script>  
-    async function graphql(query, variables = {}) {  
-      const response = await fetch(`${API_CONFIG.BASE_URL}/graphql`, {  
-        method: 'POST',  
-        credentials: 'include',  
-        headers: { 'Content-Type': 'application/json' },  
-        body: JSON.stringify({ query, variables })  
-      });  
-      const result = await response.json();  
-      if (result.errors && result.errors[0].extensions?.code === 'UNAUTHENTICATED') {  
-        window.location.href = 'login.html';  
-      }  
-      return result;  
-    }  
+    <script>
+      async function graphql(query, variables = {}) {
+        const response = await fetch(`${API_CONFIG.BASE_URL}/graphql`, {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, variables }),
+        });
+        const result = await response.json();
+        if (
+          result.errors &&
+          result.errors[0].extensions?.code === "UNAUTHENTICATED"
+        ) {
+          window.location.href = "login";
+        }
+        return result;
+      }
 
-    async function checkAuth() {  
-      const { errors } = await graphql('query { me { user { id } } }');  
-      if (errors) window.location.href = 'login.html';  
-    }  
+      async function checkAuth() {
+        const { errors } = await graphql("query { me { user { id } } }");
+        if (errors) window.location.href = "login";
+      }
 
-    async function sendRequest() {  
-      const toUserId = document.getElementById('toUserId').value.trim();  
-      const resultDiv = document.getElementById('sendResult');  
-      
-      if (!toUserId) {  
-        resultDiv.textContent = 'Enter a user ID';  
-        return;  
-      }  
+      async function sendRequest() {
+        const toUserId = document.getElementById("toUserId").value.trim();
+        const resultDiv = document.getElementById("sendResult");
 
-      const { data, errors } = await graphql(`  
-        mutation SendFriendRequest($toUserId: ID!) {  
-          sendFriendRequest(toUserId: $toUserId) {  
-            success  
-            message  
-          }  
-        }  
-      `, { toUserId });  
+        if (!toUserId) {
+          resultDiv.textContent = "Please enter a user ID";
+          resultDiv.style.background = "#fff3cd";
+          resultDiv.style.color = "#856404";
+          return;
+        }
 
-      if (errors) {  
-        resultDiv.textContent = 'Error: ' + errors[0].message;  
-      } else {  
-        resultDiv.textContent = data.sendFriendRequest.message;  
-        if (data.sendFriendRequest.success) {  
-          document.getElementById('toUserId').value = '';  
-          loadRequests();  
-        }  
-      }  
-    }  
+        const { data, errors } = await graphql(
+          `
+            mutation SendFriendRequest($toUserId: ID!) {
+              sendFriendRequest(toUserId: $toUserId) {
+                success
+                message
+              }
+            }
+          `,
+          { toUserId },
+        );
 
-    async function loadRequests() {  
-      const { data } = await graphql(`  
-        query MyFriendRequests {  
-          myFriendRequests {  
-            sent {  
-              id toUserId  
-              toUser { id username }  
-              createdAt  
-            }  
-            received {  
-              id fromUserId  
-              fromUser { id username }  
-              createdAt  
-            }  
-          }  
-        }  
-      `);  
+        if (errors) {
+          resultDiv.textContent = "Error: " + errors[0].message;
+          resultDiv.style.background = "#f8d7da";
+          resultDiv.style.color = "#721c24";
+        } else {
+          resultDiv.textContent = data.sendFriendRequest.message;
+          resultDiv.style.background = "#d4edda";
+          resultDiv.style.color = "#155724";
+          if (data.sendFriendRequest.success) {
+            document.getElementById("toUserId").value = "";
+            loadRequests();
+          }
+        }
+      }
 
-      const received = data.myFriendRequests.received;  
-      const sent = data.myFriendRequests.sent;  
+      async function loadRequests() {
+        const { data } = await graphql(`
+          query MyFriendRequests {
+            myFriendRequests {
+              sent {
+                id
+                toUserId
+                toUser {
+                  id
+                  username
+                }
+                createdAt
+              }
+              received {
+                id
+                fromUserId
+                fromUser {
+                  id
+                  username
+                }
+                createdAt
+              }
+            }
+          }
+        `);
 
-      document.getElementById('receivedCount').textContent = received.length;  
-      document.getElementById('sentCount').textContent = sent.length;  
+        const received = data.myFriendRequests.received;
+        const sent = data.myFriendRequests.sent;
 
-      const receivedList = document.getElementById('receivedList');  
-      if (received.length === 0) {  
-        receivedList.innerHTML = '<div class="empty">No pending requests</div>';  
-      } else {  
-        receivedList.innerHTML = received.map(r => `  
+        document.getElementById("receivedCount").textContent = received.length;
+        document.getElementById("sentCount").textContent = sent.length;
+
+        const receivedList = document.getElementById("receivedList");
+        if (received.length === 0) {
+          receivedList.innerHTML =
+            '<div class="empty">No pending requests</div>';
+        } else {
+          receivedList.innerHTML = received
+            .map(
+              (r) => `  
           <div class="item">  
-            <strong>${r.fromUser.username}</strong> (ID: ${r.fromUser.id})<br>  
-            <small>${new Date(r.createdAt).toLocaleString()}</small><br>  
-            <button onclick="acceptRequest('${r.id}')">Accept</button>  
-            <button onclick="refuseRequest('${r.id}')">Refuse</button>  
+            <strong>${r.fromUser.username}</strong><br>  
+            <small>User ID: ${r.fromUser.id}</small><br>  
+            <small>Received: ${new Date(r.createdAt).toLocaleString()}</small>  
+            <div>  
+              <button onclick="acceptRequest('${r.id}')">✓ Accept</button>  
+              <button onclick="refuseRequest('${r.id}')">✗ Refuse</button>  
+            </div>  
           </div>  
-        `).join('');  
-      }  
+        `,
+            )
+            .join("");
+        }
 
-      const sentList = document.getElementById('sentList');  
-      if (sent.length === 0) {  
-        sentList.innerHTML = '<div class="empty">No sent requests</div>';  
-      } else {  
-        sentList.innerHTML = sent.map(r => `  
+        const sentList = document.getElementById("sentList");
+        if (sent.length === 0) {
+          sentList.innerHTML = '<div class="empty">No sent requests</div>';
+        } else {
+          sentList.innerHTML = sent
+            .map(
+              (r) => `  
           <div class="item">  
-            <strong>${r.toUser.username}</strong> (ID: ${r.toUser.id})<br>  
-            <small>${new Date(r.createdAt).toLocaleString()}</small>  
+            <strong>${r.toUser.username}</strong><br>  
+            <small>User ID: ${r.toUser.id}</small><br>  
+            <small>Sent: ${new Date(r.createdAt).toLocaleString()}</small>  
           </div>  
-        `).join('');  
-      }  
-    }  
+        `,
+            )
+            .join("");
+        }
+      }
 
-    async function acceptRequest(requestId) {  
-      const { data } = await graphql(`  
-        mutation AcceptFriendRequest($requestId: ID!) {  
-          acceptFriendRequest(requestId: $requestId) {  
-            success  
-            message  
-          }  
-        }  
-      `, { requestId });  
+      async function acceptRequest(requestId) {
+        const { data } = await graphql(
+          `
+            mutation AcceptFriendRequest($requestId: ID!) {
+              acceptFriendRequest(requestId: $requestId) {
+                success
+                message
+              }
+            }
+          `,
+          { requestId },
+        );
+        loadRequests();
+        loadFriends();
+      }
 
-      alert(data.acceptFriendRequest.message);  
-      loadRequests();  
-      loadFriends();  
-    }  
+      async function refuseRequest(requestId) {
+        const { data } = await graphql(
+          `
+            mutation RefuseFriendRequest($requestId: ID!) {
+              refuseFriendRequest(requestId: $requestId) {
+                success
+                message
+              }
+            }
+          `,
+          { requestId },
+        );
+        loadRequests();
+      }
 
-    async function refuseRequest(requestId) {  
-      const { data } = await graphql(`  
-        mutation RefuseFriendRequest($requestId: ID!) {  
-          refuseFriendRequest(requestId: $requestId) {  
-            success  
-            message  
-          }  
-        }  
-      `, { requestId });  
+      async function loadFriends() {
+        const { data } = await graphql(`
+          query MyFriends {
+            myFriends {
+              friends {
+                friendId
+                friend {
+                  id
+                  username
+                }
+                createdAt
+              }
+            }
+          }
+        `);
 
-      alert(data.refuseFriendRequest.message);  
-      loadRequests();  
-    }  
+        const friends = data.myFriends.friends;
+        document.getElementById("friendsCount").textContent = friends.length;
 
-    async function loadFriends() {  
-      const { data } = await graphql(`  
-        query MyFriends {  
-          myFriends {  
-            friends {  
-              friendId  
-              friend { id username }  
-              createdAt  
-            }  
-          }  
-        }  
-      `);  
-
-      const friends = data.myFriends.friends;  
-      document.getElementById('friendsCount').textContent = friends.length;  
-
-      const friendsList = document.getElementById('friendsList');  
-      if (friends.length === 0) {  
-        friendsList.innerHTML = '<div class="empty">No friends yet</div>';  
-      } else {  
-        friendsList.innerHTML = friends.map(f => `  
+        const friendsList = document.getElementById("friendsList");
+        if (friends.length === 0) {
+          friendsList.innerHTML = '<div class="empty">No friends yet</div>';
+        } else {
+          friendsList.innerHTML = friends
+            .map(
+              (f) => `  
           <div class="item">  
-            <strong>${f.friend.username}</strong> (ID: ${f.friendId})<br>  
-            <small>Friends since: ${new Date(f.createdAt).toLocaleString()}</small><br>  
-            <button onclick="removeFriend('${f.friendId}', '${f.friend.username}')">Remove</button>  
+            <strong>${f.friend.username}</strong><br>  
+            <small>User ID: ${f.friendId}</small><br>  
+            <small>Friends since: ${new Date(f.createdAt).toLocaleString()}</small>  
+            <div>  
+              <button onclick="removeFriend('${f.friendId}', '${f.friend.username}')">🗑️ Remove</button>  
+            </div>  
           </div>  
-        `).join('');  
-      }  
-    }  
+        `,
+            )
+            .join("");
+        }
+      }
 
-    async function removeFriend(friendId, username) {  
-      if (!confirm(`Remove ${username} from friends?`)) return;  
+      async function removeFriend(friendId, username) {
+        if (!confirm(`Remove ${username} from friends?`)) return;
 
-      const { data } = await graphql(`  
-        mutation RemoveFriend($friendId: ID!) {  
-          removeFriend(friendId: $friendId) {  
-            success  
-            message  
-          }  
-        }  
-      `, { friendId });  
+        const { data } = await graphql(
+          `
+            mutation RemoveFriend($friendId: ID!) {
+              removeFriend(friendId: $friendId) {
+                success
+                message
+              }
+            }
+          `,
+          { friendId },
+        );
+        loadFriends();
+      }
 
-      alert(data.removeFriend.message);  
-      loadFriends();  
-    }  
-
-    (async () => {  
-      await checkAuth();  
-      await loadRequests();  
-      await loadFriends();  
-    })();  
-  </script>  
-</body>  
-</html>  
+      (async () => {
+        await checkAuth();
+        await loadRequests();
+        await loadFriends();
+      })();
+    </script>
+  </body>
+</html>
