@@ -1766,6 +1766,9 @@ function openUserInfoModal() {
     if (window.myUserId) {
       userIdDisplay.textContent = window.myUserId;
       clearInterval(checkUserId);
+      userIdDisplay.onclick = () => {
+          navigator.clipboard.writeText(userIdDisplay.textContent);
+      }
     }
   }, 100);
 
